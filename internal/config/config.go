@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
@@ -39,9 +40,18 @@ type Config struct {
 	TaskTimeout           string                 `toml:"task_timeout"`
 	TelegramAPIBase       string                 `toml:"telegram_api_base"`
 	Codex                 AgentConfig            `toml:"codex"`
+	Discord               DiscordConfig          `toml:"discord"`
 
 	taskTimeout time.Duration
 	sourceDir   string
+}
+
+type DiscordConfig struct {
+	Enabled             bool     `toml:"enabled"`
+	Token               string   `toml:"token"`
+	TokenEnv            string   `toml:"token_env"`
+	AllowedUserIDs      []string `toml:"allowed_user_ids"`
+	PrivateChannelsOnly *bool    `toml:"private_channels_only"`
 }
 
 type AgentConfig struct {
@@ -68,17 +78,20 @@ func Load(path string) (*Config, error) {
 		return nil, fmt.Errorf("resolve config path: %w", err)
 	}
 	cfg.sourceDir = filepath.Dir(abs)
-	if cfg.TelegramTokenEnv != "" {
-		if cfg.TelegramToken != "" {
-			return nil, errors.New("configure only one of telegram_token or telegram_token_env")
+	if err := resolveSecret(&cfg.TelegramToken, cfg.TelegramTokenEnv, "telegram"); err != nil {
+		return nil, err
+	}
+	if cfg.Discord.Enabled {
+		if err := resolveSecret(&cfg.Discord.Token, cfg.Discord.TokenEnv, "discord"); err != nil {
+			return nil, err
 		}
-		token, ok := os.LookupEnv(cfg.TelegramTokenEnv)
-		if !ok || strings.TrimSpace(token) == "" {
-			return nil, fmt.Errorf("environment variable %s is not set", cfg.TelegramTokenEnv)
+	}
+	hasPlaintextSecret := (cfg.TelegramToken != "" && cfg.TelegramTokenEnv == "") ||
+		(cfg.Discord.Token != "" && cfg.Discord.TokenEnv == "")
+	if hasPlaintextSecret {
+		if info, statErr := os.Stat(abs); statErr == nil && info.Mode().Perm()&0o077 != 0 {
+			return nil, fmt.Errorf("config containing a bot token must not be accessible by group or others (mode %04o)", info.Mode().Perm())
 		}
-		cfg.TelegramToken = token
-	} else if info, statErr := os.Stat(abs); statErr == nil && info.Mode().Perm()&0o077 != 0 {
-		return nil, fmt.Errorf("config containing telegram_token must not be accessible by group or others (mode %04o)", info.Mode().Perm())
 	}
 	cfg.applyDefaults()
 	if err := cfg.Validate(); err != nil {
@@ -115,6 +128,10 @@ func (c *Config) applyDefaults() {
 	if c.PrivateChatsOnly == nil {
 		value := true
 		c.PrivateChatsOnly = &value
+	}
+	if c.Discord.PrivateChannelsOnly == nil {
+		value := true
+		c.Discord.PrivateChannelsOnly = &value
 	}
 	if len(c.Agents) == 0 {
 		legacy := c.Codex
@@ -160,11 +177,26 @@ func (c *Config) applyDefaults() {
 
 func (c *Config) Validate() error {
 	var problems []error
-	if strings.TrimSpace(c.TelegramToken) == "" || c.TelegramToken == "BOT_TOKEN" {
-		problems = append(problems, errors.New("telegram_token must be configured"))
+	telegramEnabled := strings.TrimSpace(c.TelegramToken) != "" && c.TelegramToken != "BOT_TOKEN"
+	if telegramEnabled && len(c.AllowedUserIDs) == 0 {
+		problems = append(problems, errors.New("allowed_user_ids must contain at least one Telegram user ID"))
 	}
-	if len(c.AllowedUserIDs) == 0 {
-		problems = append(problems, errors.New("allowed_user_ids must contain at least one user ID"))
+	if c.Discord.Enabled {
+		if strings.TrimSpace(c.Discord.Token) == "" || c.Discord.Token == "BOT_TOKEN" {
+			problems = append(problems, errors.New("discord token must be configured when Discord is enabled"))
+		}
+		if len(c.Discord.AllowedUserIDs) == 0 {
+			problems = append(problems, errors.New("discord.allowed_user_ids must contain at least one user ID"))
+		}
+		for _, userID := range c.Discord.AllowedUserIDs {
+			value, err := strconv.ParseUint(userID, 10, 64)
+			if err != nil || value == 0 {
+				problems = append(problems, fmt.Errorf("Discord user ID %q must be a positive numeric snowflake", userID))
+			}
+		}
+	}
+	if !telegramEnabled && !c.Discord.Enabled {
+		problems = append(problems, errors.New("at least one Telegram or Discord transport must be configured"))
 	}
 	if len(c.ProjectRoots) == 0 {
 		problems = append(problems, errors.New("project_roots must contain at least one path"))
@@ -244,6 +276,26 @@ func (c *Config) IsAllowedUser(id int64) bool {
 	return false
 }
 
+func (c *Config) IsAllowedDiscordUser(id string) bool {
+	for _, allowed := range c.Discord.AllowedUserIDs {
+		if id == allowed {
+			return true
+		}
+	}
+	return false
+}
+
+func (c *Config) SecretEnvNames() []string {
+	var names []string
+	if c.TelegramTokenEnv != "" {
+		names = append(names, c.TelegramTokenEnv)
+	}
+	if c.Discord.TokenEnv != "" {
+		names = append(names, c.Discord.TokenEnv)
+	}
+	return names
+}
+
 func (c *Config) EnabledAgents() map[string]AgentConfig {
 	result := make(map[string]AgentConfig)
 	for name, configured := range c.Agents {
@@ -269,4 +321,19 @@ func normalizeID(value string) string {
 		}
 	}
 	return strings.Trim(b.String(), "-")
+}
+
+func resolveSecret(destination *string, envName, label string) error {
+	if envName == "" {
+		return nil
+	}
+	if *destination != "" {
+		return fmt.Errorf("configure only one of %s token or token_env", label)
+	}
+	token, ok := os.LookupEnv(envName)
+	if !ok || strings.TrimSpace(token) == "" {
+		return fmt.Errorf("environment variable %s is not set", envName)
+	}
+	*destination = token
+	return nil
 }

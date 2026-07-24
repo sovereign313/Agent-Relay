@@ -1,7 +1,7 @@
 #!/sbin/openrc-run
 
 name="Agent Relay"
-description="Telegram relay for local Codex sessions"
+description="Telegram and Discord relay for local coding-agent sessions"
 command="/usr/local/bin/agent-relay"
 command_args="run --config /etc/agent-relay/config.toml"
 command_user="agent-relay:agent-relay"

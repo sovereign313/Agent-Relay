@@ -17,6 +17,7 @@ import (
 	"github.com/sovereign313/Agent-Relay/internal/claude"
 	"github.com/sovereign313/Agent-Relay/internal/codex"
 	"github.com/sovereign313/Agent-Relay/internal/config"
+	"github.com/sovereign313/Agent-Relay/internal/discord"
 	"github.com/sovereign313/Agent-Relay/internal/grok"
 	"github.com/sovereign313/Agent-Relay/internal/logging"
 	"github.com/sovereign313/Agent-Relay/internal/opencode"
@@ -24,6 +25,7 @@ import (
 	"github.com/sovereign313/Agent-Relay/internal/relay"
 	"github.com/sovereign313/Agent-Relay/internal/store"
 	"github.com/sovereign313/Agent-Relay/internal/telegram"
+	"github.com/sovereign313/Agent-Relay/internal/transport"
 )
 
 var version = "dev"
@@ -119,7 +121,6 @@ func runDaemon(configPath string) error {
 	if err != nil {
 		return err
 	}
-	client := telegram.New(cfg.TelegramToken, cfg.TelegramAPIBase, nil)
 	runners := newRunners(cfg)
 	agentVersions, err := validateAgents(context.Background(), runners)
 	if err != nil {
@@ -128,7 +129,28 @@ func runDaemon(configPath string) error {
 
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
-	service := relay.New(ctx, cfg, logger, client, stateStore, catalog, runners, version, agentVersions)
+	var telegramTransport relay.Telegram
+	if cfg.TelegramToken != "" && cfg.TelegramToken != "BOT_TOKEN" {
+		client := telegram.New(cfg.TelegramToken, cfg.TelegramAPIBase, nil)
+		telegramTransport = telegram.NewRelayTransport(client)
+	}
+	var sources []transport.Source
+	if cfg.Discord.Enabled {
+		allowed := make(map[string]struct{}, len(cfg.Discord.AllowedUserIDs))
+		for _, userID := range cfg.Discord.AllowedUserIDs {
+			allowed[userID] = struct{}{}
+		}
+		gateway, err := discord.New(discord.Config{
+			Token:               cfg.Discord.Token,
+			AllowedUserIDs:      allowed,
+			PrivateChannelsOnly: *cfg.Discord.PrivateChannelsOnly,
+		}, logger)
+		if err != nil {
+			return err
+		}
+		sources = append(sources, gateway)
+	}
+	service := relay.New(ctx, cfg, logger, telegramTransport, stateStore, catalog, runners, version, agentVersions, sources...)
 	logger.Info(
 		"agent relay starting",
 		"version", version,
@@ -146,10 +168,7 @@ func runDaemon(configPath string) error {
 }
 
 func newRunners(cfg *config.Config) map[string]agent.Runner {
-	var removeEnv []string
-	if cfg.TelegramTokenEnv != "" {
-		removeEnv = append(removeEnv, cfg.TelegramTokenEnv)
-	}
+	removeEnv := cfg.SecretEnvNames()
 	runners := make(map[string]agent.Runner)
 	for name, configured := range cfg.EnabledAgents() {
 		switch configured.Type {

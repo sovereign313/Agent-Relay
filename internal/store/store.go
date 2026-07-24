@@ -10,6 +10,8 @@ import (
 	"strconv"
 	"sync"
 	"time"
+
+	"github.com/sovereign313/Agent-Relay/internal/transport"
 )
 
 type SessionState string
@@ -31,45 +33,49 @@ const (
 )
 
 type Conversation struct {
-	ChatID       int64        `json:"chat_id"`
-	ProjectID    string       `json:"project_id"`
-	ProjectPath  string       `json:"project_path"`
-	AgentName    string       `json:"agent_name"`
-	ThreadID     string       `json:"thread_id,omitempty"`
-	State        SessionState `json:"state"`
-	CreatedAt    time.Time    `json:"created_at"`
-	LastActivity time.Time    `json:"last_activity"`
-	LastError    string       `json:"last_error,omitempty"`
-	LastResponse string       `json:"last_response,omitempty"`
+	Transport      string       `json:"transport"`
+	ConversationID string       `json:"conversation_id"`
+	ProjectID      string       `json:"project_id"`
+	ProjectPath    string       `json:"project_path"`
+	AgentName      string       `json:"agent_name"`
+	ThreadID       string       `json:"thread_id,omitempty"`
+	State          SessionState `json:"state"`
+	CreatedAt      time.Time    `json:"created_at"`
+	LastActivity   time.Time    `json:"last_activity"`
+	LastError      string       `json:"last_error,omitempty"`
+	LastResponse   string       `json:"last_response,omitempty"`
 }
 
 type PendingJob struct {
-	ID          int64     `json:"id"`
-	ChatID      int64     `json:"chat_id"`
-	ProjectID   string    `json:"project_id"`
-	ProjectPath string    `json:"project_path"`
-	AgentName   string    `json:"agent_name"`
-	Prompt      string    `json:"prompt"`
-	State       JobState  `json:"state"`
-	CreatedAt   time.Time `json:"created_at"`
+	ID             int64     `json:"id"`
+	Transport      string    `json:"transport"`
+	ConversationID string    `json:"conversation_id"`
+	ProjectID      string    `json:"project_id"`
+	ProjectPath    string    `json:"project_path"`
+	AgentName      string    `json:"agent_name"`
+	Prompt         string    `json:"prompt"`
+	State          JobState  `json:"state"`
+	CreatedAt      time.Time `json:"created_at"`
 }
 
 type OutboxMessage struct {
-	ID        string    `json:"id"`
-	ChatID    int64     `json:"chat_id"`
-	Text      string    `json:"text"`
-	CreatedAt time.Time `json:"created_at"`
-	Attempts  int       `json:"attempts"`
+	ID             string    `json:"id"`
+	Transport      string    `json:"transport"`
+	ConversationID string    `json:"conversation_id"`
+	Text           string    `json:"text"`
+	CreatedAt      time.Time `json:"created_at"`
+	Attempts       int       `json:"attempts"`
 }
 
 type state struct {
-	Version        int                      `json:"version"`
-	UpdateOffset   int64                    `json:"update_offset"`
-	Selected       map[string]string        `json:"selected_projects"`
-	SelectedAgents map[string]string        `json:"selected_agents"`
-	Conversations  map[string]Conversation  `json:"conversations"`
-	Jobs           map[string]PendingJob    `json:"jobs"`
-	Outbox         map[string]OutboxMessage `json:"outbox"`
+	Version         int                      `json:"version"`
+	UpdateOffset    int64                    `json:"update_offset"`
+	Selected        map[string]string        `json:"selected_projects"`
+	SelectedAgents  map[string]string        `json:"selected_agents"`
+	Conversations   map[string]Conversation  `json:"conversations"`
+	Jobs            map[string]PendingJob    `json:"jobs"`
+	Outbox          map[string]OutboxMessage `json:"outbox"`
+	ProcessedEvents map[string]time.Time     `json:"processed_events,omitempty"`
 }
 
 type Store struct {
@@ -82,12 +88,13 @@ func Open(path string) (*Store, error) {
 	store := &Store{
 		path: path,
 		data: state{
-			Version:        3,
-			Selected:       make(map[string]string),
-			SelectedAgents: make(map[string]string),
-			Conversations:  make(map[string]Conversation),
-			Jobs:           make(map[string]PendingJob),
-			Outbox:         make(map[string]OutboxMessage),
+			Version:         4,
+			Selected:        make(map[string]string),
+			SelectedAgents:  make(map[string]string),
+			Conversations:   make(map[string]Conversation),
+			Jobs:            make(map[string]PendingJob),
+			Outbox:          make(map[string]OutboxMessage),
+			ProcessedEvents: make(map[string]time.Time),
 		},
 	}
 
@@ -116,25 +123,11 @@ func Open(path string) (*Store, error) {
 	if store.data.Outbox == nil {
 		store.data.Outbox = make(map[string]OutboxMessage)
 	}
-	if store.data.Version < 3 {
-		conversations := make(map[string]Conversation, len(store.data.Conversations))
-		for _, conversation := range store.data.Conversations {
-			if conversation.AgentName == "" {
-				conversation.AgentName = "codex"
-			}
-			conversations[conversationKey(conversation.ChatID, conversation.ProjectID, conversation.AgentName)] = conversation
-		}
-		store.data.Conversations = conversations
-		for key, job := range store.data.Jobs {
-			if job.AgentName == "" {
-				job.AgentName = "codex"
-				store.data.Jobs[key] = job
-			}
-		}
-		store.data.Version = 3
-		if err := store.persistLocked(); err != nil {
-			return nil, fmt.Errorf("migrate state: %w", err)
-		}
+	if store.data.ProcessedEvents == nil {
+		store.data.ProcessedEvents = make(map[string]time.Time)
+	}
+	if store.data.Version != 4 {
+		return nil, fmt.Errorf("unsupported state version %d; remove the state file to initialize version 4", store.data.Version)
 	}
 	return store, nil
 }
@@ -166,65 +159,83 @@ func (s *Store) AcceptUpdate(updateID int64, job *PendingJob, conversation *Conv
 		s.data.Jobs[jobKey(job.ID)] = *job
 	}
 	if conversation != nil {
-		s.data.Conversations[conversationKey(conversation.ChatID, conversation.ProjectID, conversation.AgentName)] = *conversation
+		s.data.Conversations[conversationKey(conversation.address(), conversation.ProjectID, conversation.AgentName)] = *conversation
 	}
 	s.data.UpdateOffset = updateID + 1
 	return true, s.persistLocked()
 }
 
-func (s *Store) SelectedProject(chatID int64) string {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	return s.data.Selected[strconv.FormatInt(chatID, 10)]
-}
-
-func (s *Store) SetSelectedProject(chatID int64, projectID string) error {
+func (s *Store) AcceptEvent(eventID string, job *PendingJob, conversation *Conversation) (bool, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.data.Selected[strconv.FormatInt(chatID, 10)] = projectID
+	if _, exists := s.data.ProcessedEvents[eventID]; exists {
+		return false, nil
+	}
+	if job != nil {
+		job.State = JobPending
+		s.data.Jobs[jobKey(job.ID)] = *job
+	}
+	if conversation != nil {
+		s.data.Conversations[conversationKey(conversation.address(), conversation.ProjectID, conversation.AgentName)] = *conversation
+	}
+	s.data.ProcessedEvents[eventID] = time.Now().UTC()
+	s.pruneProcessedEventsLocked(4096)
+	return true, s.persistLocked()
+}
+
+func (s *Store) SelectedProject(address transport.Address) string {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.data.Selected[address.Key()]
+}
+
+func (s *Store) SetSelectedProject(address transport.Address, projectID string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.data.Selected[address.Key()] = projectID
 	return s.persistLocked()
 }
 
-func (s *Store) SelectedAgent(chatID int64) string {
+func (s *Store) SelectedAgent(address transport.Address) string {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	return s.data.SelectedAgents[strconv.FormatInt(chatID, 10)]
+	return s.data.SelectedAgents[address.Key()]
 }
 
-func (s *Store) SetSelectedAgent(chatID int64, agentName string) error {
+func (s *Store) SetSelectedAgent(address transport.Address, agentName string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.data.SelectedAgents[strconv.FormatInt(chatID, 10)] = agentName
+	s.data.SelectedAgents[address.Key()] = agentName
 	return s.persistLocked()
 }
 
-func (s *Store) Conversation(chatID int64, projectID, agentName string) (Conversation, bool) {
+func (s *Store) Conversation(address transport.Address, projectID, agentName string) (Conversation, bool) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	conversation, ok := s.data.Conversations[conversationKey(chatID, projectID, agentName)]
+	conversation, ok := s.data.Conversations[conversationKey(address, projectID, agentName)]
 	return conversation, ok
 }
 
 func (s *Store) PutConversation(conversation Conversation) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.data.Conversations[conversationKey(conversation.ChatID, conversation.ProjectID, conversation.AgentName)] = conversation
+	s.data.Conversations[conversationKey(conversation.address(), conversation.ProjectID, conversation.AgentName)] = conversation
 	return s.persistLocked()
 }
 
-func (s *Store) DeleteConversation(chatID int64, projectID, agentName string) error {
+func (s *Store) DeleteConversation(address transport.Address, projectID, agentName string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	delete(s.data.Conversations, conversationKey(chatID, projectID, agentName))
+	delete(s.data.Conversations, conversationKey(address, projectID, agentName))
 	return s.persistLocked()
 }
 
-func (s *Store) Conversations(chatID int64) []Conversation {
+func (s *Store) Conversations(address transport.Address) []Conversation {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	result := make([]Conversation, 0)
 	for _, conversation := range s.data.Conversations {
-		if conversation.ChatID == chatID {
+		if conversation.address() == address {
 			result = append(result, conversation)
 		}
 	}
@@ -275,7 +286,7 @@ func (s *Store) StartJob(id int64, conversation Conversation) error {
 	}
 	job.State = JobWorking
 	s.data.Jobs[jobKey(id)] = job
-	s.data.Conversations[conversationKey(conversation.ChatID, conversation.ProjectID, conversation.AgentName)] = conversation
+	s.data.Conversations[conversationKey(conversation.address(), conversation.ProjectID, conversation.AgentName)] = conversation
 	return s.persistLocked()
 }
 
@@ -305,7 +316,7 @@ func (s *Store) CompleteJob(id int64, conversation Conversation, messages []Outb
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	delete(s.data.Jobs, jobKey(id))
-	s.data.Conversations[conversationKey(conversation.ChatID, conversation.ProjectID, conversation.AgentName)] = conversation
+	s.data.Conversations[conversationKey(conversation.address(), conversation.ProjectID, conversation.AgentName)] = conversation
 	for _, message := range messages {
 		if message.ID != "" {
 			s.data.Outbox[message.ID] = message
@@ -314,12 +325,12 @@ func (s *Store) CompleteJob(id int64, conversation Conversation, messages []Outb
 	return s.persistLocked()
 }
 
-func (s *Store) ClearJobs(chatID int64, projectID, agentName string, excludeID int64) ([]int64, error) {
+func (s *Store) ClearJobs(address transport.Address, projectID, agentName string, excludeID int64) ([]int64, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	var removed []int64
 	for key, job := range s.data.Jobs {
-		if job.ChatID != chatID || job.ProjectID != projectID || job.AgentName != agentName || job.State == JobWorking || job.ID == excludeID {
+		if job.address() != address || job.ProjectID != projectID || job.AgentName != agentName || job.State == JobWorking || job.ID == excludeID {
 			continue
 		}
 		removed = append(removed, job.ID)
@@ -439,10 +450,44 @@ func (s *Store) persistLocked() error {
 	return os.Chmod(s.path, 0o600)
 }
 
-func conversationKey(chatID int64, projectID, agentName string) string {
-	return strconv.FormatInt(chatID, 10) + ":" + projectID + ":" + agentName
+func conversationKey(address transport.Address, projectID, agentName string) string {
+	return address.Key() + ":" + projectID + ":" + agentName
 }
 
 func jobKey(id int64) string {
 	return strconv.FormatInt(id, 10)
+}
+
+func (c Conversation) address() transport.Address {
+	return transport.Address{Transport: c.Transport, ConversationID: c.ConversationID}
+}
+
+func (j PendingJob) address() transport.Address {
+	return transport.Address{Transport: j.Transport, ConversationID: j.ConversationID}
+}
+
+func (m OutboxMessage) address() transport.Address {
+	return transport.Address{Transport: m.Transport, ConversationID: m.ConversationID}
+}
+
+func (c Conversation) Address() transport.Address  { return c.address() }
+func (j PendingJob) Address() transport.Address    { return j.address() }
+func (m OutboxMessage) Address() transport.Address { return m.address() }
+
+func (s *Store) pruneProcessedEventsLocked(limit int) {
+	if len(s.data.ProcessedEvents) <= limit {
+		return
+	}
+	type event struct {
+		id string
+		at time.Time
+	}
+	events := make([]event, 0, len(s.data.ProcessedEvents))
+	for id, at := range s.data.ProcessedEvents {
+		events = append(events, event{id: id, at: at})
+	}
+	sort.Slice(events, func(i, j int) bool { return events[i].at.Before(events[j].at) })
+	for _, item := range events[:len(events)-limit] {
+		delete(s.data.ProcessedEvents, item.id)
+	}
 }

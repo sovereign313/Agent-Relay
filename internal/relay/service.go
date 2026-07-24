@@ -16,19 +16,20 @@ import (
 	"github.com/sovereign313/Agent-Relay/internal/session"
 	"github.com/sovereign313/Agent-Relay/internal/store"
 	"github.com/sovereign313/Agent-Relay/internal/telegram"
+	"github.com/sovereign313/Agent-Relay/internal/transport"
 )
 
 type Telegram interface {
+	transport.Sender
 	GetUpdates(context.Context, int64) ([]telegram.Update, error)
-	Send(context.Context, int64, string) error
-	SendKeyboard(context.Context, int64, string, [][]telegram.Button) error
-	AnswerCallback(context.Context, string, string) error
 }
 
 type Service struct {
 	cfg      *config.Config
 	log      *slog.Logger
 	telegram Telegram
+	senders  map[string]transport.Sender
+	sources  []transport.Source
 	store    *store.Store
 	runners  map[string]agent.Runner
 	sessions *session.Manager
@@ -55,11 +56,21 @@ func New(
 	runners map[string]agent.Runner,
 	version string,
 	agentVersions map[string]string,
+	sources ...transport.Source,
 ) *Service {
+	senders := make(map[string]transport.Sender)
+	if client != nil {
+		senders[client.Name()] = client
+	}
+	for _, source := range sources {
+		senders[source.Name()] = source
+	}
 	service := &Service{
 		cfg:           cfg,
 		log:           logger,
 		telegram:      client,
+		senders:       senders,
+		sources:       sources,
 		store:         stateStore,
 		catalog:       catalog,
 		runners:       runners,
@@ -75,24 +86,59 @@ func New(
 
 func (s *Service) Run(ctx context.Context) error {
 	defer s.sessions.Close()
+	runContext, cancel := context.WithCancel(ctx)
+	defer cancel()
 	interrupted, err := s.store.ReconcileStartup()
 	if err != nil {
 		return fmt.Errorf("reconcile persisted state: %w", err)
 	}
 	for _, job := range interrupted {
 		message := store.OutboxMessage{
-			ID:        fmt.Sprintf("interrupted:%d", job.ID),
-			ChatID:    job.ChatID,
-			Text:      fmt.Sprintf("Job %d for %s in %s was interrupted by an Agent Relay restart. Select that project and agent, then use /retry %d to run it again or /clearqueue to discard it.", job.ID, job.AgentName, job.ProjectID, job.ID),
-			CreatedAt: time.Now().UTC(),
+			ID:             fmt.Sprintf("interrupted:%d", job.ID),
+			Transport:      job.Transport,
+			ConversationID: job.ConversationID,
+			Text:           fmt.Sprintf("Job %d for %s in %s was interrupted by an Agent Relay restart. Select that project and agent, then use /retry %d to run it again or /clearqueue to discard it.", job.ID, job.AgentName, job.ProjectID, job.ID),
+			CreatedAt:      time.Now().UTC(),
 		}
 		if err := s.store.PutOutbox(message); err != nil {
 			return fmt.Errorf("persist interrupted-job notice: %w", err)
 		}
 	}
-	go s.runOutbox(ctx)
+	go s.runOutbox(runContext)
 	s.dispatchPending()
+	transportCount := len(s.sources)
+	if s.telegram != nil {
+		transportCount++
+	}
+	transportErrors := make(chan error, transportCount)
+	for _, source := range s.sources {
+		source := source
+		go func() {
+			err := source.Run(runContext, s.handleInbound)
+			if err == nil && runContext.Err() == nil {
+				err = fmt.Errorf("%s transport stopped unexpectedly", source.Name())
+			}
+			transportErrors <- err
+		}()
+	}
+	if s.telegram != nil {
+		go func() {
+			transportErrors <- s.runTelegram(runContext)
+		}()
+	}
 
+	select {
+	case <-ctx.Done():
+		return nil
+	case err := <-transportErrors:
+		if err == nil && ctx.Err() != nil {
+			return nil
+		}
+		return err
+	}
+}
+
+func (s *Service) runTelegram(ctx context.Context) error {
 	offset := s.store.UpdateOffset()
 	s.log.Info("telegram polling started", "offset", offset)
 
@@ -139,18 +185,19 @@ func (s *Service) handleUpdate(ctx context.Context, update telegram.Update) erro
 		return err
 	}
 	text := strings.TrimSpace(message.Text)
+	address := transport.Address{Transport: transport.Telegram, ConversationID: strconv.FormatInt(message.Chat.ID, 10)}
 	if text == "" {
 		if _, err := s.store.AcceptUpdate(update.UpdateID, nil, nil); err != nil {
 			return err
 		}
-		s.send(message.Chat.ID, "Only text messages are supported.")
+		s.send(address, "Only text messages are supported.")
 		return nil
 	}
 	if len([]byte(text)) > s.cfg.MaxMessageBytes {
 		if _, err := s.store.AcceptUpdate(update.UpdateID, nil, nil); err != nil {
 			return err
 		}
-		s.send(message.Chat.ID, fmt.Sprintf("Message is too large. Limit: %d bytes.", s.cfg.MaxMessageBytes))
+		s.send(address, fmt.Sprintf("Message is too large. Limit: %d bytes.", s.cfg.MaxMessageBytes))
 		return nil
 	}
 
@@ -162,70 +209,119 @@ func (s *Service) handleUpdate(ctx context.Context, update telegram.Update) erro
 		if !accepted {
 			return nil
 		}
-		s.handleCommand(ctx, message.Chat.ID, text)
+		s.handleCommand(ctx, address, text)
 		return nil
 	}
-	return s.acceptJob(update.UpdateID, message.Chat.ID, text)
+	return s.acceptJob(transport.Inbound{
+		EventID:  fmt.Sprintf("telegram:%d", update.UpdateID),
+		Sequence: update.UpdateID,
+		Address:  address,
+		UserID:   strconv.FormatInt(message.From.ID, 10),
+		Private:  message.Chat.Type == "private",
+		Text:     text,
+	})
 }
 
-func (s *Service) handleCommand(ctx context.Context, chatID int64, text string) {
+func (s *Service) handleInbound(ctx context.Context, inbound transport.Inbound) error {
+	if !inbound.Address.Valid() || inbound.EventID == "" {
+		return fmt.Errorf("invalid inbound transport event")
+	}
+	text := strings.TrimSpace(inbound.Text)
+	if len([]byte(text)) > s.cfg.MaxMessageBytes {
+		if _, err := s.acceptInbound(inbound, nil, nil); err != nil {
+			return err
+		}
+		s.send(inbound.Address, fmt.Sprintf("Message is too large. Limit: %d bytes.", s.cfg.MaxMessageBytes))
+		return nil
+	}
+	if inbound.Action != nil {
+		accepted, err := s.acceptInbound(inbound, nil, nil)
+		if err != nil || !accepted {
+			return err
+		}
+		s.handleAction(inbound.Address, inbound.Action)
+		return nil
+	}
+	if text == "" {
+		_, err := s.acceptInbound(inbound, nil, nil)
+		return err
+	}
+	if strings.HasPrefix(text, "/") {
+		accepted, err := s.acceptInbound(inbound, nil, nil)
+		if err != nil || !accepted {
+			return err
+		}
+		s.handleCommand(ctx, inbound.Address, text)
+		return nil
+	}
+	return s.acceptJob(inbound)
+}
+
+func (s *Service) acceptInbound(inbound transport.Inbound, job *store.PendingJob, conversation *store.Conversation) (bool, error) {
+	if inbound.Address.Transport == transport.Telegram {
+		return s.store.AcceptUpdate(inbound.Sequence, job, conversation)
+	}
+	return s.store.AcceptEvent(inbound.EventID, job, conversation)
+}
+
+func (s *Service) handleCommand(ctx context.Context, address transport.Address, text string) {
 	fields := strings.Fields(text)
 	command := strings.ToLower(strings.SplitN(fields[0], "@", 2)[0])
 	switch command {
 	case "/start", "/help":
-		s.send(chatID, helpText)
+		s.send(address, helpText)
 	case "/projects", "/list":
-		s.sendProjects(chatID)
+		s.sendProjects(address)
 	case "/agents":
-		s.sendAgents(chatID)
+		s.sendAgents(address)
 	case "/agent":
 		if len(fields) != 2 {
-			s.send(chatID, "Usage: /agent <agent-name>")
+			s.send(address, "Usage: /agent <agent-name>")
 			return
 		}
-		s.selectAgent(chatID, fields[1])
+		s.selectAgent(address, fields[1])
 	case "/project", "/use":
 		if len(fields) != 2 {
-			s.send(chatID, "Usage: /project <project-id>")
+			s.send(address, "Usage: /project <project-id>")
 			return
 		}
-		s.selectProject(chatID, fields[1])
+		s.selectProject(address, fields[1])
 	case "/sessions":
-		s.send(chatID, s.sessionsMessage(chatID))
+		s.send(address, s.sessionsMessage(address))
 	case "/queue":
-		s.send(chatID, s.queueMessage(chatID))
+		s.send(address, s.queueMessage(address))
 	case "/clearqueue":
-		s.clearQueue(chatID)
+		s.clearQueue(address)
 	case "/new", "/restart":
-		s.newConversation(chatID)
+		s.newConversation(address)
 	case "/last":
-		s.sendLast(chatID)
+		s.sendLast(address)
 	case "/status":
-		s.send(chatID, s.statusMessage(chatID))
+		s.send(address, s.statusMessage(address))
 	case "/cancel":
-		s.cancel(chatID)
+		s.cancel(address)
 	case "/cancelall":
-		s.cancelAll(chatID)
+		s.cancelAll(address)
 	case "/retry":
 		if len(fields) != 2 {
-			s.send(chatID, "Usage: /retry <job-id>")
+			s.send(address, "Usage: /retry <job-id>")
 			return
 		}
 		jobID, err := strconv.ParseInt(fields[1], 10, 64)
 		if err != nil {
-			s.send(chatID, "Job ID must be a number.")
+			s.send(address, "Job ID must be a number.")
 			return
 		}
-		s.retryJob(chatID, jobID)
+		s.retryJob(address, jobID)
 	case "/refresh":
 		if err := s.refreshCatalog(); err != nil {
 			s.log.Error("project refresh failed", "error", err)
-			s.send(chatID, "Project refresh failed: "+safeError(err))
+			s.send(address, "Project refresh failed: "+safeError(err))
 			return
 		}
-		s.sendProjects(chatID)
+		s.sendProjects(address)
 	default:
-		s.send(chatID, "Unknown command. Use /help.")
+		s.send(address, "Unknown command. Use /help.")
 	}
 }
 
@@ -248,85 +344,90 @@ func (s *Service) handleCallback(update telegram.Update) error {
 	if err != nil || !accepted {
 		return err
 	}
-	switch {
-	case strings.HasPrefix(callback.Data, "project:"):
-		projectID := strings.TrimPrefix(callback.Data, "project:")
-		if _, ok := s.getProject(projectID); !ok {
-			s.answerCallback(callback.ID, "Project unavailable")
-			return nil
-		}
-		s.selectProject(callback.Message.Chat.ID, projectID)
-		s.answerCallback(callback.ID, "Selected "+projectID)
-	case strings.HasPrefix(callback.Data, "agent:"):
-		agentName := strings.TrimPrefix(callback.Data, "agent:")
-		if _, ok := s.runners[agentName]; !ok {
-			s.answerCallback(callback.ID, "Agent unavailable")
-			return nil
-		}
-		s.selectAgent(callback.Message.Chat.ID, agentName)
-		s.answerCallback(callback.ID, "Selected "+agentName)
-	default:
-		s.answerCallback(callback.ID, "Unknown action")
-	}
+	address := transport.Address{Transport: transport.Telegram, ConversationID: strconv.FormatInt(callback.Message.Chat.ID, 10)}
+	s.handleAction(address, &transport.Action{ID: callback.ID, Data: callback.Data})
 	return nil
 }
 
-func (s *Service) selectProject(chatID int64, id string) {
+func (s *Service) handleAction(address transport.Address, action *transport.Action) {
+	switch {
+	case strings.HasPrefix(action.Data, "project:"):
+		projectID := strings.TrimPrefix(action.Data, "project:")
+		if _, ok := s.getProject(projectID); !ok {
+			s.answerAction(address.Transport, action.ID, "Project unavailable")
+			return
+		}
+		s.selectProject(address, projectID)
+		s.answerAction(address.Transport, action.ID, "Selected "+projectID)
+	case strings.HasPrefix(action.Data, "agent:"):
+		agentName := strings.TrimPrefix(action.Data, "agent:")
+		if _, ok := s.runners[agentName]; !ok {
+			s.answerAction(address.Transport, action.ID, "Agent unavailable")
+			return
+		}
+		s.selectAgent(address, agentName)
+		s.answerAction(address.Transport, action.ID, "Selected "+agentName)
+	default:
+		s.answerAction(address.Transport, action.ID, "Unknown action")
+	}
+}
+
+func (s *Service) selectProject(address transport.Address, id string) {
 	selected, ok := s.getProject(id)
 	if !ok {
-		s.send(chatID, "Unknown project. Run /projects to list available projects.")
+		s.send(address, "Unknown project. Run /projects to list available projects.")
 		return
 	}
-	if err := s.store.SetSelectedProject(chatID, selected.ID); err != nil {
+	if err := s.store.SetSelectedProject(address, selected.ID); err != nil {
 		s.log.Error("persist selected project", "error", err)
-		s.send(chatID, "Could not save the selected project.")
+		s.send(address, "Could not save the selected project.")
 		return
 	}
-	agentName := s.selectedAgent(chatID)
-	if conversation, exists := s.store.Conversation(chatID, selected.ID, agentName); exists && conversation.ThreadID != "" {
-		s.send(chatID, "Selected "+selected.ID+". Existing "+agentName+" context will be resumed.")
+	agentName := s.selectedAgent(address)
+	if conversation, exists := s.store.Conversation(address, selected.ID, agentName); exists && conversation.ThreadID != "" {
+		s.send(address, "Selected "+selected.ID+". Existing "+agentName+" context will be resumed.")
 	} else {
-		s.send(chatID, "Selected "+selected.ID+". The next message starts a new "+agentName+" context.")
+		s.send(address, "Selected "+selected.ID+". The next message starts a new "+agentName+" context.")
 	}
 }
 
-func (s *Service) selectAgent(chatID int64, name string) {
+func (s *Service) selectAgent(address transport.Address, name string) {
 	name = strings.ToLower(strings.TrimSpace(name))
 	if _, ok := s.runners[name]; !ok {
-		s.send(chatID, "Unknown agent. Run /agents to list available agents.")
+		s.send(address, "Unknown agent. Run /agents to list available agents.")
 		return
 	}
-	if err := s.store.SetSelectedAgent(chatID, name); err != nil {
+	if err := s.store.SetSelectedAgent(address, name); err != nil {
 		s.log.Error("persist selected agent", "error_type", fmt.Sprintf("%T", err))
-		s.send(chatID, "Could not save the selected agent.")
+		s.send(address, "Could not save the selected agent.")
 		return
 	}
-	projectID := s.store.SelectedProject(chatID)
+	projectID := s.store.SelectedProject(address)
 	if projectID == "" {
-		s.send(chatID, "Selected "+name+". Select a project with /projects.")
+		s.send(address, "Selected "+name+". Select a project with /projects.")
 		return
 	}
-	if conversation, exists := s.store.Conversation(chatID, projectID, name); exists && conversation.ThreadID != "" {
-		s.send(chatID, "Selected "+name+". Existing context for "+projectID+" will be resumed.")
+	if conversation, exists := s.store.Conversation(address, projectID, name); exists && conversation.ThreadID != "" {
+		s.send(address, "Selected "+name+". Existing context for "+projectID+" will be resumed.")
 	} else {
-		s.send(chatID, "Selected "+name+". The next message starts a new context for "+projectID+".")
+		s.send(address, "Selected "+name+". The next message starts a new context for "+projectID+".")
 	}
 }
 
-func (s *Service) newConversation(chatID int64) {
-	projectID := s.store.SelectedProject(chatID)
+func (s *Service) newConversation(address transport.Address) {
+	projectID := s.store.SelectedProject(address)
 	if projectID == "" {
-		s.send(chatID, "Select a project first with /project <project-id>.")
+		s.send(address, "Select a project first with /project <project-id>.")
 		return
 	}
-	agentName := s.selectedAgent(chatID)
-	key := session.Key{ChatID: chatID, ProjectID: projectID, AgentName: agentName}
+	agentName := s.selectedAgent(address)
+	key := session.Key{Address: address, ProjectID: projectID, AgentName: agentName}
 	status := s.sessions.Status(key)
-	if status.Working || status.Queued > 0 || s.hasPersistedJobs(chatID, projectID, agentName) {
-		s.send(chatID, "Cancel the active task and wait for the queue to clear before starting a new context.")
+	if status.Working || status.Queued > 0 || s.hasPersistedJobs(address, projectID, agentName) {
+		s.send(address, "Cancel the active task and wait for the queue to clear before starting a new context.")
 		return
 	}
-	if conversation, exists := s.store.Conversation(chatID, projectID, agentName); exists && conversation.ThreadID != "" {
+	if conversation, exists := s.store.Conversation(address, projectID, agentName); exists && conversation.ThreadID != "" {
 		if resetter, ok := s.runners[agentName].(agent.Resetter); ok {
 			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 			err := resetter.Reset(ctx, conversation.ThreadID)
@@ -336,26 +437,26 @@ func (s *Service) newConversation(chatID int64) {
 			}
 		}
 	}
-	if err := s.store.DeleteConversation(chatID, projectID, agentName); err != nil {
+	if err := s.store.DeleteConversation(address, projectID, agentName); err != nil {
 		s.log.Error("delete conversation", "error", err)
-		s.send(chatID, "Could not reset the "+agentName+" context.")
+		s.send(address, "Could not reset the "+agentName+" context.")
 		return
 	}
-	s.send(chatID, "The next message will start a new "+agentName+" context for "+projectID+".")
+	s.send(address, "The next message will start a new "+agentName+" context for "+projectID+".")
 }
 
-func (s *Service) cancel(chatID int64) {
-	projectID := s.store.SelectedProject(chatID)
+func (s *Service) cancel(address transport.Address) {
+	projectID := s.store.SelectedProject(address)
 	if projectID == "" {
-		s.send(chatID, "No project is selected.")
+		s.send(address, "No project is selected.")
 		return
 	}
-	agentName := s.selectedAgent(chatID)
-	if !s.sessions.Cancel(session.Key{ChatID: chatID, ProjectID: projectID, AgentName: agentName}) {
-		s.send(chatID, agentName+" is not currently working in "+projectID+".")
+	agentName := s.selectedAgent(address)
+	if !s.sessions.Cancel(session.Key{Address: address, ProjectID: projectID, AgentName: agentName}) {
+		s.send(address, agentName+" is not currently working in "+projectID+".")
 		return
 	}
-	if conversation, exists := s.store.Conversation(chatID, projectID, agentName); exists {
+	if conversation, exists := s.store.Conversation(address, projectID, agentName); exists {
 		conversation.State = store.StateStopped
 		conversation.LastActivity = time.Now().UTC()
 		conversation.LastError = "cancellation requested"
@@ -363,26 +464,26 @@ func (s *Service) cancel(chatID int64) {
 			s.log.Error("persist cancellation state", "error_type", fmt.Sprintf("%T", err))
 		}
 	}
-	s.send(chatID, "Cancelling the current "+agentName+" task...")
+	s.send(address, "Cancelling the current "+agentName+" task...")
 }
 
-func (s *Service) cancelAll(chatID int64) {
-	count := s.sessions.CancelChat(chatID)
+func (s *Service) cancelAll(address transport.Address) {
+	count := s.sessions.CancelAddress(address)
 	if count == 0 {
-		s.send(chatID, "No agent tasks are currently running.")
+		s.send(address, "No agent tasks are currently running.")
 		return
 	}
-	s.send(chatID, fmt.Sprintf("Cancelling %d running agent task(s)...", count))
+	s.send(address, fmt.Sprintf("Cancelling %d running agent task(s)...", count))
 }
 
-func (s *Service) clearQueue(chatID int64) {
-	projectID := s.store.SelectedProject(chatID)
+func (s *Service) clearQueue(address transport.Address) {
+	projectID := s.store.SelectedProject(address)
 	if projectID == "" {
-		s.send(chatID, "No project is selected.")
+		s.send(address, "No project is selected.")
 		return
 	}
-	agentName := s.selectedAgent(chatID)
-	key := session.Key{ChatID: chatID, ProjectID: projectID, AgentName: agentName}
+	agentName := s.selectedAgent(address)
+	key := session.Key{Address: address, ProjectID: projectID, AgentName: agentName}
 	status := s.sessions.Status(key)
 	excludeID := int64(-1)
 	if status.Working {
@@ -392,81 +493,81 @@ func (s *Service) clearQueue(chatID int64) {
 	for _, job := range removedMemory {
 		s.markDispatched(job.ID, false)
 	}
-	removed, err := s.store.ClearJobs(chatID, projectID, agentName, excludeID)
+	removed, err := s.store.ClearJobs(address, projectID, agentName, excludeID)
 	if err != nil {
 		s.log.Error("clear persisted jobs", "error_type", fmt.Sprintf("%T", err))
-		s.send(chatID, "Could not clear the persisted queue.")
+		s.send(address, "Could not clear the persisted queue.")
 		return
 	}
 	for _, id := range removed {
 		s.markDispatched(id, false)
 	}
 	if !status.Working {
-		if conversation, exists := s.store.Conversation(chatID, projectID, agentName); exists && conversation.State == store.StateQueued {
+		if conversation, exists := s.store.Conversation(address, projectID, agentName); exists && conversation.State == store.StateQueued {
 			conversation.State = store.StateIdle
 			conversation.LastActivity = time.Now().UTC()
 			_ = s.store.PutConversation(conversation)
 		}
 	}
-	s.send(chatID, fmt.Sprintf("Cleared %d queued or interrupted %s job(s) from %s.", len(removed), agentName, projectID))
+	s.send(address, fmt.Sprintf("Cleared %d queued or interrupted %s job(s) from %s.", len(removed), agentName, projectID))
 }
 
-func (s *Service) retryJob(chatID, jobID int64) {
+func (s *Service) retryJob(address transport.Address, jobID int64) {
 	job, ok := s.store.Job(jobID)
-	if !ok || job.ChatID != chatID {
-		s.send(chatID, "Unknown job ID.")
+	if !ok || job.Address() != address {
+		s.send(address, "Unknown job ID.")
 		return
 	}
-	if selected := s.store.SelectedProject(chatID); selected != job.ProjectID {
-		s.send(chatID, "Select "+job.ProjectID+" before retrying this job.")
+	if selected := s.store.SelectedProject(address); selected != job.ProjectID {
+		s.send(address, "Select "+job.ProjectID+" before retrying this job.")
 		return
 	}
-	if selected := s.selectedAgent(chatID); selected != job.AgentName {
-		s.send(chatID, "Select "+job.AgentName+" with /agent before retrying this job.")
+	if selected := s.selectedAgent(address); selected != job.AgentName {
+		s.send(address, "Select "+job.AgentName+" with /agent before retrying this job.")
 		return
 	}
 	job, err := s.store.RetryJob(jobID)
 	if err != nil {
-		s.send(chatID, safeError(err))
+		s.send(address, safeError(err))
 		return
 	}
-	if conversation, exists := s.store.Conversation(chatID, job.ProjectID, job.AgentName); exists {
+	if conversation, exists := s.store.Conversation(address, job.ProjectID, job.AgentName); exists {
 		conversation.State = store.StateQueued
 		conversation.LastActivity = time.Now().UTC()
 		conversation.LastError = ""
 		if err := s.store.PutConversation(conversation); err != nil {
-			s.send(chatID, "Job is pending, but its session state could not be updated.")
+			s.send(address, "Job is pending, but its session state could not be updated.")
 		}
 	}
 	queued, err := s.dispatchJob(job)
 	if err != nil {
-		s.send(chatID, "Job was marked pending and will run when queue space is available.")
+		s.send(address, "Job was marked pending and will run when queue space is available.")
 		return
 	}
 	if queued {
-		s.send(chatID, fmt.Sprintf("Job %d was queued.", jobID))
+		s.send(address, fmt.Sprintf("Job %d was queued.", jobID))
 	} else {
-		s.send(chatID, fmt.Sprintf("Retrying job %d with %s in %s...", jobID, job.AgentName, job.ProjectID))
+		s.send(address, fmt.Sprintf("Retrying job %d with %s in %s...", jobID, job.AgentName, job.ProjectID))
 	}
 }
 
-func (s *Service) sendLast(chatID int64) {
-	projectID := s.store.SelectedProject(chatID)
+func (s *Service) sendLast(address transport.Address) {
+	projectID := s.store.SelectedProject(address)
 	if projectID == "" {
-		s.send(chatID, "No project is selected.")
+		s.send(address, "No project is selected.")
 		return
 	}
-	agentName := s.selectedAgent(chatID)
-	conversation, exists := s.store.Conversation(chatID, projectID, agentName)
+	agentName := s.selectedAgent(address)
+	conversation, exists := s.store.Conversation(address, projectID, agentName)
 	if !exists || conversation.LastResponse == "" {
-		s.send(chatID, "No completed "+agentName+" response is stored for "+projectID+".")
+		s.send(address, "No completed "+agentName+" response is stored for "+projectID+".")
 		return
 	}
-	s.send(chatID, conversation.LastResponse)
+	s.send(address, conversation.LastResponse)
 }
 
-func (s *Service) projectsMessage(chatID int64) string {
-	selected := s.store.SelectedProject(chatID)
+func (s *Service) projectsMessage(address transport.Address) string {
+	selected := s.store.SelectedProject(address)
 	projects := s.listProjects()
 	if len(projects) == 0 {
 		return "No Git projects were discovered beneath the configured roots."
@@ -483,17 +584,17 @@ func (s *Service) projectsMessage(chatID int64) string {
 	return strings.Join(lines, "\n")
 }
 
-func (s *Service) sendProjects(chatID int64) {
-	message := s.projectsMessage(chatID)
+func (s *Service) sendProjects(address transport.Address) {
+	message := s.projectsMessage(address)
 	projects := s.listProjects()
-	rows := make([][]telegram.Button, 0, (len(projects)+1)/2)
-	var row []telegram.Button
+	rows := make([][]transport.Button, 0, (len(projects)+1)/2)
+	var row []transport.Button
 	for _, item := range projects {
 		data := "project:" + item.ID
 		if len(data) > 64 {
 			continue
 		}
-		row = append(row, telegram.Button{Text: item.ID, Data: data})
+		row = append(row, transport.Button{Text: item.ID, Data: data})
 		if len(row) == 2 {
 			rows = append(rows, row)
 			row = nil
@@ -504,13 +605,18 @@ func (s *Service) sendProjects(chatID int64) {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
-	if err := s.telegram.SendKeyboard(ctx, chatID, message, rows); err != nil {
-		s.log.Error("send project keyboard", "chat_id", chatID, "error_type", fmt.Sprintf("%T", err))
+	sender := s.sender(address)
+	if sender == nil {
+		s.log.Error("send project keyboard", "address", address, "error", "transport unavailable")
+		return
+	}
+	if err := sender.SendKeyboard(ctx, address.ConversationID, message, rows); err != nil {
+		s.log.Error("send project keyboard", "address", address, "error_type", fmt.Sprintf("%T", err))
 	}
 }
 
-func (s *Service) agentsMessage(chatID int64) string {
-	selected := s.selectedAgent(chatID)
+func (s *Service) agentsMessage(address transport.Address) string {
+	selected := s.selectedAgent(address)
 	names := make([]string, 0, len(s.runners))
 	for name := range s.runners {
 		names = append(names, name)
@@ -527,29 +633,34 @@ func (s *Service) agentsMessage(chatID int64) string {
 	return strings.Join(lines, "\n")
 }
 
-func (s *Service) sendAgents(chatID int64) {
+func (s *Service) sendAgents(address transport.Address) {
 	names := make([]string, 0, len(s.runners))
 	for name := range s.runners {
 		names = append(names, name)
 	}
 	sort.Strings(names)
-	rows := make([][]telegram.Button, 0, (len(names)+1)/2)
+	rows := make([][]transport.Button, 0, (len(names)+1)/2)
 	for index := 0; index < len(names); index += 2 {
-		row := []telegram.Button{{Text: names[index], Data: "agent:" + names[index]}}
+		row := []transport.Button{{Text: names[index], Data: "agent:" + names[index]}}
 		if index+1 < len(names) {
-			row = append(row, telegram.Button{Text: names[index+1], Data: "agent:" + names[index+1]})
+			row = append(row, transport.Button{Text: names[index+1], Data: "agent:" + names[index+1]})
 		}
 		rows = append(rows, row)
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
-	if err := s.telegram.SendKeyboard(ctx, chatID, s.agentsMessage(chatID), rows); err != nil {
-		s.log.Error("send agent keyboard", "chat_id", chatID, "error_type", fmt.Sprintf("%T", err))
+	sender := s.sender(address)
+	if sender == nil {
+		s.log.Error("send agent keyboard", "address", address, "error", "transport unavailable")
+		return
+	}
+	if err := sender.SendKeyboard(ctx, address.ConversationID, s.agentsMessage(address), rows); err != nil {
+		s.log.Error("send agent keyboard", "address", address, "error_type", fmt.Sprintf("%T", err))
 	}
 }
 
-func (s *Service) sessionsMessage(chatID int64) string {
-	conversations := s.store.Conversations(chatID)
+func (s *Service) sessionsMessage(address transport.Address) string {
+	conversations := s.store.Conversations(address)
 	if len(conversations) == 0 {
 		return "No agent project sessions have been created."
 	}
@@ -567,15 +678,15 @@ func (s *Service) sessionsMessage(chatID int64) string {
 	return strings.Join(lines, "\n")
 }
 
-func (s *Service) queueMessage(chatID int64) string {
-	projectID := s.store.SelectedProject(chatID)
+func (s *Service) queueMessage(address transport.Address) string {
+	projectID := s.store.SelectedProject(address)
 	if projectID == "" {
 		return "No project is selected."
 	}
-	agentName := s.selectedAgent(chatID)
+	agentName := s.selectedAgent(address)
 	var jobs []store.PendingJob
 	for _, job := range s.store.Jobs() {
-		if job.ChatID == chatID && job.ProjectID == projectID && job.AgentName == agentName {
+		if job.Address() == address && job.ProjectID == projectID && job.AgentName == agentName {
 			jobs = append(jobs, job)
 		}
 	}
@@ -593,8 +704,8 @@ func (s *Service) queueMessage(chatID int64) string {
 	return strings.Join(lines, "\n")
 }
 
-func (s *Service) statusMessage(chatID int64) string {
-	agentName := s.selectedAgent(chatID)
+func (s *Service) statusMessage(address transport.Address) string {
+	agentName := s.selectedAgent(address)
 	runtime := fmt.Sprintf(
 		"Agent Relay: %s\nAgent: %s (%s)\nUptime: %s",
 		s.version,
@@ -602,7 +713,7 @@ func (s *Service) statusMessage(chatID int64) string {
 		s.agentVersions[agentName],
 		formatUptime(time.Since(s.startedAt)),
 	)
-	projectID := s.store.SelectedProject(chatID)
+	projectID := s.store.SelectedProject(address)
 	if projectID == "" {
 		return runtime + "\nProject: not selected"
 	}
@@ -610,8 +721,8 @@ func (s *Service) statusMessage(chatID int64) string {
 	if !ok {
 		return runtime + "\nProject: " + projectID + "\nState: unavailable"
 	}
-	conversation, exists := s.store.Conversation(chatID, projectID, agentName)
-	status := s.sessions.Status(session.Key{ChatID: chatID, ProjectID: projectID, AgentName: agentName})
+	conversation, exists := s.store.Conversation(address, projectID, agentName)
+	status := s.sessions.Status(session.Key{Address: address, ProjectID: projectID, AgentName: agentName})
 	state := store.StateIdle
 	thread := "not started"
 	if exists {
@@ -627,7 +738,7 @@ func (s *Service) statusMessage(chatID int64) string {
 	}
 	durableJobs := 0
 	for _, job := range s.store.Jobs() {
-		if job.ChatID == chatID && job.ProjectID == projectID && job.AgentName == agentName {
+		if job.Address() == address && job.ProjectID == projectID && job.AgentName == agentName {
 			durableJobs++
 		}
 	}
@@ -671,8 +782,8 @@ func (s *Service) listProjects() []project.Project {
 	return s.catalog.List()
 }
 
-func (s *Service) selectedAgent(chatID int64) string {
-	name := s.store.SelectedAgent(chatID)
+func (s *Service) selectedAgent(address transport.Address) string {
+	name := s.store.SelectedAgent(address)
 	if _, ok := s.runners[name]; ok {
 		return name
 	}

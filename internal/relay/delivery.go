@@ -2,27 +2,38 @@ package relay
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 	"time"
 
 	"github.com/sovereign313/Agent-Relay/internal/store"
 	"github.com/sovereign313/Agent-Relay/internal/telegram"
+	"github.com/sovereign313/Agent-Relay/internal/transport"
 )
 
-func (s *Service) send(chatID int64, message string) {
+func (s *Service) send(address transport.Address, message string) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
-	if err := s.telegram.Send(ctx, chatID, message); err != nil {
-		s.log.Error("send Telegram message", "chat_id", chatID, "error", err)
+	sender := s.sender(address)
+	if sender == nil {
+		s.log.Error("send message", "address", address, "error", "transport unavailable")
+		return
+	}
+	if err := sender.Send(ctx, address.ConversationID, message); err != nil {
+		s.log.Error("send message", "address", address, "error_type", fmt.Sprintf("%T", err))
 	}
 }
 
-func (s *Service) answerCallback(callbackID, message string) {
+func (s *Service) answerAction(transportName, actionID, message string) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	if err := s.telegram.AnswerCallback(ctx, callbackID, message); err != nil {
-		s.log.Error("answer Telegram callback", "error_type", fmt.Sprintf("%T", err))
+	sender := s.senders[transportName]
+	if sender == nil {
+		return
+	}
+	if err := sender.AnswerAction(ctx, actionID, message); err != nil && !errors.Is(err, transport.ErrUnsupported) {
+		s.log.Error("answer transport action", "transport", transportName, "error_type", fmt.Sprintf("%T", err))
 	}
 }
 
@@ -46,12 +57,18 @@ func (s *Service) deliverOutbox(ctx context.Context) {
 	s.deliveryMu.Lock()
 	defer s.deliveryMu.Unlock()
 	for _, message := range s.store.Outbox() {
+		sender := s.sender(message.Address())
+		if sender == nil {
+			_ = s.store.IncrementOutboxAttempts(message.ID)
+			s.log.Error("deliver persisted response", "outbox_id", message.ID, "transport", message.Transport, "error", "transport unavailable")
+			continue
+		}
 		sendContext, cancel := context.WithTimeout(ctx, 2*time.Minute)
-		err := s.telegram.Send(sendContext, message.ChatID, message.Text)
+		err := sender.Send(sendContext, message.ConversationID, message.Text)
 		cancel()
 		if err != nil {
 			_ = s.store.IncrementOutboxAttempts(message.ID)
-			s.log.Error("deliver persisted Telegram response", "outbox_id", message.ID, "error_type", fmt.Sprintf("%T", err))
+			s.log.Error("deliver persisted response", "outbox_id", message.ID, "transport", message.Transport, "error_type", fmt.Sprintf("%T", err))
 			continue
 		}
 		if err := s.store.RemoveOutbox(message.ID); err != nil {
@@ -80,19 +97,28 @@ func formatUptime(duration time.Duration) string {
 	return fmt.Sprintf("%dm", minutes)
 }
 
-func makeOutboxMessages(idPrefix string, chatID int64, message string) []store.OutboxMessage {
-	parts := telegram.Split(telegram.Sanitize(message), telegram.MaxMessageLength)
+func (s *Service) makeOutboxMessages(idPrefix string, address transport.Address, message string) []store.OutboxMessage {
+	limit := telegram.MaxMessageLength
+	if sender := s.sender(address); sender != nil {
+		limit = sender.MaxMessageLength()
+	}
+	parts := telegram.Split(telegram.Sanitize(message), limit)
 	now := time.Now().UTC()
 	messages := make([]store.OutboxMessage, 0, len(parts))
 	for index, part := range parts {
 		messages = append(messages, store.OutboxMessage{
-			ID:        fmt.Sprintf("%s:%d", idPrefix, index),
-			ChatID:    chatID,
-			Text:      part,
-			CreatedAt: now.Add(time.Duration(index) * time.Nanosecond),
+			ID:             fmt.Sprintf("%s:%d", idPrefix, index),
+			Transport:      address.Transport,
+			ConversationID: address.ConversationID,
+			Text:           part,
+			CreatedAt:      now.Add(time.Duration(index) * time.Nanosecond),
 		})
 	}
 	return messages
+}
+
+func (s *Service) sender(address transport.Address) transport.Sender {
+	return s.senders[address.Transport]
 }
 
 func safeError(err error) string {
@@ -127,4 +153,5 @@ const helpText = `Agent Relay commands:
 /refresh — rescan configured project roots
 /help — show this message
 
+On Discord, use ! in place of / (for example, !projects).
 Send any other text to the selected agent in the selected project.`

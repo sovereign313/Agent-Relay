@@ -9,57 +9,62 @@ import (
 	"github.com/sovereign313/Agent-Relay/internal/agent"
 	"github.com/sovereign313/Agent-Relay/internal/session"
 	"github.com/sovereign313/Agent-Relay/internal/store"
+	"github.com/sovereign313/Agent-Relay/internal/transport"
 )
 
-func (s *Service) acceptJob(updateID, chatID int64, prompt string) error {
-	projectID := s.store.SelectedProject(chatID)
+func (s *Service) acceptJob(inbound transport.Inbound) error {
+	updateID := inbound.Sequence
+	address := inbound.Address
+	prompt := inbound.Text
+	projectID := s.store.SelectedProject(address)
 	if projectID == "" {
-		if _, err := s.store.AcceptUpdate(updateID, nil, nil); err != nil {
+		if _, err := s.acceptInbound(inbound, nil, nil); err != nil {
 			return err
 		}
-		s.send(chatID, "Select a project first with /projects and /project <project-id>.")
+		s.send(address, "Select a project first with /projects and /project <project-id>.")
 		return nil
 	}
 	selected, ok := s.getProject(projectID)
 	if !ok {
-		if _, err := s.store.AcceptUpdate(updateID, nil, nil); err != nil {
+		if _, err := s.acceptInbound(inbound, nil, nil); err != nil {
 			return err
 		}
-		s.send(chatID, "The selected project is no longer available. Run /projects and select another.")
+		s.send(address, "The selected project is no longer available. Run /projects and select another.")
 		return nil
 	}
-	agentName := s.selectedAgent(chatID)
+	agentName := s.selectedAgent(address)
 	if _, ok := s.runners[agentName]; !ok {
-		if _, err := s.store.AcceptUpdate(updateID, nil, nil); err != nil {
+		if _, err := s.acceptInbound(inbound, nil, nil); err != nil {
 			return err
 		}
-		s.send(chatID, "The selected agent is unavailable. Run /agents and select another.")
+		s.send(address, "The selected agent is unavailable. Run /agents and select another.")
 		return nil
 	}
-	status := s.sessions.Status(session.Key{ChatID: chatID, ProjectID: selected.ID, AgentName: agentName})
+	status := s.sessions.Status(session.Key{Address: address, ProjectID: selected.ID, AgentName: agentName})
 	if status.Queued >= s.cfg.QueueSize {
-		if _, err := s.store.AcceptUpdate(updateID, nil, nil); err != nil {
+		if _, err := s.acceptInbound(inbound, nil, nil); err != nil {
 			return err
 		}
-		s.send(chatID, "The queue for this project is full.")
+		s.send(address, "The queue for this project is full.")
 		return nil
 	}
 
 	now := time.Now().UTC()
-	conversation, exists := s.store.Conversation(chatID, selected.ID, agentName)
+	conversation, exists := s.store.Conversation(address, selected.ID, agentName)
 	if !exists {
 		conversation = store.Conversation{
-			ChatID:      chatID,
-			ProjectID:   selected.ID,
-			ProjectPath: selected.Path,
-			AgentName:   agentName,
-			CreatedAt:   now,
+			Transport:      address.Transport,
+			ConversationID: address.ConversationID,
+			ProjectID:      selected.ID,
+			ProjectPath:    selected.Path,
+			AgentName:      agentName,
+			CreatedAt:      now,
 		}
 	} else if conversation.ProjectPath != "" && conversation.ProjectPath != selected.Path {
 		s.log.Warn(
 			"project path changed; resetting agent thread",
 			"agent", agentName,
-			"chat_id", chatID,
+			"chat_id", address,
 			"project", selected.ID,
 			"old_path", conversation.ProjectPath,
 			"new_path", selected.Path,
@@ -73,17 +78,18 @@ func (s *Service) acceptJob(updateID, chatID int64, prompt string) error {
 	conversation.LastActivity = now
 	conversation.LastError = ""
 	job := store.PendingJob{
-		ID:          updateID,
-		ChatID:      chatID,
-		ProjectID:   selected.ID,
-		ProjectPath: selected.Path,
-		AgentName:   agentName,
-		Prompt:      prompt,
-		CreatedAt:   now,
+		ID:             updateID,
+		Transport:      address.Transport,
+		ConversationID: address.ConversationID,
+		ProjectID:      selected.ID,
+		ProjectPath:    selected.Path,
+		AgentName:      agentName,
+		Prompt:         prompt,
+		CreatedAt:      now,
 	}
-	accepted, err := s.store.AcceptUpdate(updateID, &job, &conversation)
+	accepted, err := s.acceptInbound(inbound, &job, &conversation)
 	if err != nil {
-		return fmt.Errorf("persist Telegram job: %w", err)
+		return fmt.Errorf("persist transport job: %w", err)
 	}
 	if !accepted {
 		return nil
@@ -93,16 +99,16 @@ func (s *Service) acceptJob(updateID, chatID int64, prompt string) error {
 		if stateErr := s.store.SetJobState(job.ID, store.JobPending); stateErr != nil {
 			return stateErr
 		}
-		s.send(chatID, "The task was saved and will run when queue space is available.")
+		s.send(address, "The task was saved and will run when queue space is available.")
 		return nil
 	}
 	if err != nil {
 		return fmt.Errorf("queue agent task: %w", err)
 	}
 	if queued {
-		s.send(chatID, "Queued behind the current task.")
+		s.send(address, "Queued behind the current task.")
 	} else {
-		s.send(chatID, agentName+" is working in "+selected.ID+"...")
+		s.send(address, agentName+" is working in "+selected.ID+"...")
 	}
 	return nil
 }
@@ -111,7 +117,7 @@ func (s *Service) process(parent context.Context, job session.Job) {
 	timeoutContext, cancel := context.WithTimeout(parent, s.cfg.TaskDuration())
 	defer cancel()
 
-	conversation, exists := s.store.Conversation(job.Key.ChatID, job.Key.ProjectID, job.Key.AgentName)
+	conversation, exists := s.store.Conversation(job.Key.Address, job.Key.ProjectID, job.Key.AgentName)
 	if !exists {
 		s.completeWithoutConversation(job, "Agent session state was lost before the task started.")
 		return
@@ -142,7 +148,7 @@ func (s *Service) process(parent context.Context, job session.Job) {
 		OnEvent: func(event agent.Event) {
 			switch event.Type {
 			case "turn.started", "turn.completed", "turn.failed", "error":
-				s.log.Debug("agent event", "agent", job.Key.AgentName, "chat_id", job.Key.ChatID, "project", job.Key.ProjectID, "type", event.Type)
+				s.log.Debug("agent event", "agent", job.Key.AgentName, "chat_id", job.Key.Address, "project", job.Key.ProjectID, "type", event.Type)
 			}
 		},
 	})
@@ -165,7 +171,7 @@ func (s *Service) process(parent context.Context, job session.Job) {
 			s.log.Error(
 				"agent task failed",
 				"agent", job.Key.AgentName,
-				"chat_id", job.Key.ChatID,
+				"chat_id", job.Key.Address,
 				"project", job.Key.ProjectID,
 				"job_id", job.ID,
 				"error_type", fmt.Sprintf("%T", err),
@@ -178,7 +184,7 @@ func (s *Service) process(parent context.Context, job session.Job) {
 		conversation.LastResponse = result.FinalMessage
 		deliveryText = result.FinalMessage
 	}
-	messages := makeOutboxMessages(fmt.Sprintf("job:%d", job.ID), job.Key.ChatID, deliveryText)
+	messages := s.makeOutboxMessages(fmt.Sprintf("job:%d", job.ID), job.Key.Address, deliveryText)
 	if persistErr := s.store.CompleteJob(job.ID, conversation, messages); persistErr != nil {
 		s.log.Error("persist completed conversation", "job_id", job.ID, "error_type", fmt.Sprintf("%T", persistErr))
 	}
@@ -202,7 +208,7 @@ func (s *Service) dispatchJob(job store.PendingJob) (bool, error) {
 	}
 	queued, err := s.sessions.Enqueue(session.Job{
 		ID:          job.ID,
-		Key:         session.Key{ChatID: job.ChatID, ProjectID: job.ProjectID, AgentName: job.AgentName},
+		Key:         session.Key{Address: job.Address(), ProjectID: job.ProjectID, AgentName: job.AgentName},
 		ProjectPath: job.ProjectPath,
 		AgentName:   job.AgentName,
 		Prompt:      job.Prompt,
@@ -241,16 +247,17 @@ func (s *Service) markDispatched(jobID int64, value bool) {
 func (s *Service) completeWithoutConversation(job session.Job, text string) {
 	now := time.Now().UTC()
 	conversation := store.Conversation{
-		ChatID:       job.Key.ChatID,
-		ProjectID:    job.Key.ProjectID,
-		ProjectPath:  job.ProjectPath,
-		AgentName:    job.Key.AgentName,
-		State:        store.StateFailed,
-		CreatedAt:    now,
-		LastActivity: now,
-		LastError:    text,
+		Transport:      job.Key.Address.Transport,
+		ConversationID: job.Key.Address.ConversationID,
+		ProjectID:      job.Key.ProjectID,
+		ProjectPath:    job.ProjectPath,
+		AgentName:      job.Key.AgentName,
+		State:          store.StateFailed,
+		CreatedAt:      now,
+		LastActivity:   now,
+		LastError:      text,
 	}
-	messages := makeOutboxMessages(fmt.Sprintf("job:%d", job.ID), job.Key.ChatID, text)
+	messages := s.makeOutboxMessages(fmt.Sprintf("job:%d", job.ID), job.Key.Address, text)
 	if err := s.store.CompleteJob(job.ID, conversation, messages); err != nil {
 		s.log.Error("complete failed job", "job_id", job.ID, "error_type", fmt.Sprintf("%T", err))
 	}
@@ -258,9 +265,9 @@ func (s *Service) completeWithoutConversation(job session.Job, text string) {
 	s.wakeOutbox()
 }
 
-func (s *Service) hasPersistedJobs(chatID int64, projectID, agentName string) bool {
+func (s *Service) hasPersistedJobs(address transport.Address, projectID, agentName string) bool {
 	for _, job := range s.store.Jobs() {
-		if job.ChatID == chatID && job.ProjectID == projectID && job.AgentName == agentName {
+		if job.Address() == address && job.ProjectID == projectID && job.AgentName == agentName {
 			return true
 		}
 	}

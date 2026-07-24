@@ -18,6 +18,16 @@ queue_size = 5
 max_message_bytes = 32768
 task_timeout = "2h"
 
+[discord]
+enabled = false
+# Prefer an environment variable. The Discord transport uses an outbound
+# Gateway connection and does not require a webhook or inbound port.
+token_env = "AGENT_RELAY_DISCORD_TOKEN"
+allowed_user_ids = [
+  "123456789012345678"
+]
+private_channels_only = true
+
 [project_aliases]
 harness-studio = "WaspLogic/HarnessStudio"
 rapidrfq = "WaspLogic/RapidRFQ"

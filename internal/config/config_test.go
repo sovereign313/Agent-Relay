@@ -122,3 +122,28 @@ enabled = false
 		t.Fatal("disabled Grok agent was enabled")
 	}
 }
+
+func TestLoadSupportsDiscordWithoutTelegram(t *testing.T) {
+	t.Setenv("AGENT_RELAY_TEST_DISCORD_TOKEN", "discord-secret")
+	path := filepath.Join(t.TempDir(), "config.toml")
+	data := `project_roots = ["/tmp"]
+
+[discord]
+enabled = true
+token_env = "AGENT_RELAY_TEST_DISCORD_TOKEN"
+allowed_user_ids = ["123456789012345678"]
+`
+	if err := os.WriteFile(path, []byte(data), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Discord.Token != "discord-secret" || !*cfg.Discord.PrivateChannelsOnly {
+		t.Fatalf("Discord config = %#v", cfg.Discord)
+	}
+	if got := cfg.SecretEnvNames(); len(got) != 1 || got[0] != "AGENT_RELAY_TEST_DISCORD_TOKEN" {
+		t.Fatalf("secret env names = %#v", got)
+	}
+}

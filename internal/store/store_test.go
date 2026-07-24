@@ -1,12 +1,15 @@
 package store
 
 import (
-	"encoding/json"
 	"os"
 	"path/filepath"
 	"testing"
 	"time"
+
+	"github.com/sovereign313/Agent-Relay/internal/transport"
 )
+
+var telegramAddress = transport.Address{Transport: transport.Telegram, ConversationID: "42"}
 
 func TestStoreRoundTripAndPermissions(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "state", "state.json")
@@ -14,19 +17,20 @@ func TestStoreRoundTripAndPermissions(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := stateStore.SetSelectedProject(42, "harness-studio"); err != nil {
+	if err := stateStore.SetSelectedProject(telegramAddress, "harness-studio"); err != nil {
 		t.Fatal(err)
 	}
 	now := time.Now().UTC().Truncate(time.Second)
 	conversation := Conversation{
-		ChatID:       42,
-		ProjectID:    "harness-studio",
-		ProjectPath:  "/projects/HarnessStudio",
-		AgentName:    "codex",
-		ThreadID:     "thread-123",
-		State:        StateIdle,
-		CreatedAt:    now,
-		LastActivity: now,
+		Transport:      transport.Telegram,
+		ConversationID: "42",
+		ProjectID:      "harness-studio",
+		ProjectPath:    "/projects/HarnessStudio",
+		AgentName:      "codex",
+		ThreadID:       "thread-123",
+		State:          StateIdle,
+		CreatedAt:      now,
+		LastActivity:   now,
 	}
 	if err := stateStore.PutConversation(conversation); err != nil {
 		t.Fatal(err)
@@ -44,10 +48,10 @@ func TestStoreRoundTripAndPermissions(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got := reopened.SelectedProject(42); got != "harness-studio" {
+	if got := reopened.SelectedProject(telegramAddress); got != "harness-studio" {
 		t.Fatalf("selected project = %q", got)
 	}
-	got, ok := reopened.Conversation(42, "harness-studio", "codex")
+	got, ok := reopened.Conversation(telegramAddress, "harness-studio", "codex")
 	if !ok || got.ThreadID != "thread-123" {
 		t.Fatalf("conversation = %#v, %v", got, ok)
 	}
@@ -61,22 +65,24 @@ func TestStoreReconcilesWorkingJobWithoutReplayingIt(t *testing.T) {
 	}
 	now := time.Now().UTC()
 	conversation := Conversation{
-		ChatID:       42,
-		ProjectID:    "alpha",
-		ProjectPath:  "/projects/alpha",
-		AgentName:    "codex",
-		State:        StateQueued,
-		CreatedAt:    now,
-		LastActivity: now,
+		Transport:      transport.Telegram,
+		ConversationID: "42",
+		ProjectID:      "alpha",
+		ProjectPath:    "/projects/alpha",
+		AgentName:      "codex",
+		State:          StateQueued,
+		CreatedAt:      now,
+		LastActivity:   now,
 	}
 	job := PendingJob{
-		ID:          100,
-		ChatID:      42,
-		ProjectID:   "alpha",
-		ProjectPath: "/projects/alpha",
-		AgentName:   "codex",
-		Prompt:      "change something",
-		CreatedAt:   now,
+		ID:             100,
+		Transport:      transport.Telegram,
+		ConversationID: "42",
+		ProjectID:      "alpha",
+		ProjectPath:    "/projects/alpha",
+		AgentName:      "codex",
+		Prompt:         "change something",
+		CreatedAt:      now,
 	}
 	if accepted, err := stateStore.AcceptUpdate(100, &job, &conversation); err != nil || !accepted {
 		t.Fatalf("AcceptUpdate = %v, %v", accepted, err)
@@ -97,7 +103,7 @@ func TestStoreReconcilesWorkingJobWithoutReplayingIt(t *testing.T) {
 	if len(interrupted) != 1 || interrupted[0].State != JobInterrupted {
 		t.Fatalf("interrupted jobs = %#v", interrupted)
 	}
-	got, _ := reopened.Conversation(42, "alpha", "codex")
+	got, _ := reopened.Conversation(telegramAddress, "alpha", "codex")
 	if got.State != StateStopped {
 		t.Fatalf("conversation state = %q, want stopped", got.State)
 	}
@@ -109,12 +115,12 @@ func TestCompleteJobAtomicallyCreatesOutboxMessage(t *testing.T) {
 		t.Fatal(err)
 	}
 	now := time.Now().UTC()
-	conversation := Conversation{ChatID: 42, ProjectID: "alpha", AgentName: "codex", CreatedAt: now}
-	job := PendingJob{ID: 7, ChatID: 42, ProjectID: "alpha", AgentName: "codex", Prompt: "task", CreatedAt: now}
+	conversation := Conversation{Transport: transport.Telegram, ConversationID: "42", ProjectID: "alpha", AgentName: "codex", CreatedAt: now}
+	job := PendingJob{ID: 7, Transport: transport.Telegram, ConversationID: "42", ProjectID: "alpha", AgentName: "codex", Prompt: "task", CreatedAt: now}
 	if _, err := stateStore.AcceptUpdate(7, &job, &conversation); err != nil {
 		t.Fatal(err)
 	}
-	message := OutboxMessage{ID: "job:7", ChatID: 42, Text: "done", CreatedAt: now}
+	message := OutboxMessage{ID: "job:7", Transport: transport.Telegram, ConversationID: "42", Text: "done", CreatedAt: now}
 	if err := stateStore.CompleteJob(7, conversation, []OutboxMessage{message}); err != nil {
 		t.Fatal(err)
 	}
@@ -127,44 +133,28 @@ func TestCompleteJobAtomicallyCreatesOutboxMessage(t *testing.T) {
 	}
 }
 
-func TestOpenMigratesVersionTwoSessionsToCodex(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "state.json")
-	legacy := map[string]any{
-		"version":           2,
-		"selected_projects": map[string]string{"42": "alpha"},
-		"conversations": map[string]any{
-			"42:alpha": map[string]any{
-				"chat_id": 42, "project_id": "alpha", "thread_id": "thread-old",
-			},
-		},
-		"jobs":   map[string]any{},
-		"outbox": map[string]any{},
-	}
-	data, err := json.Marshal(legacy)
+func TestStoreSeparatesTransportsAndDeduplicatesEvents(t *testing.T) {
+	stateStore, err := Open(filepath.Join(t.TempDir(), "state.json"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(path, data, 0o600); err != nil {
+	discordAddress := transport.Address{Transport: transport.Discord, ConversationID: "42"}
+	if err := stateStore.SetSelectedProject(telegramAddress, "telegram-project"); err != nil {
 		t.Fatal(err)
 	}
-
-	stateStore, err := Open(path)
-	if err != nil {
+	if err := stateStore.SetSelectedProject(discordAddress, "discord-project"); err != nil {
 		t.Fatal(err)
 	}
-	conversation, ok := stateStore.Conversation(42, "alpha", "codex")
-	if !ok || conversation.AgentName != "codex" || conversation.ThreadID != "thread-old" {
-		t.Fatalf("migrated conversation = %#v, %v", conversation, ok)
+	if got := stateStore.SelectedProject(telegramAddress); got != "telegram-project" {
+		t.Fatalf("Telegram project = %q", got)
 	}
-	persisted, err := os.ReadFile(path)
-	if err != nil {
-		t.Fatal(err)
+	if got := stateStore.SelectedProject(discordAddress); got != "discord-project" {
+		t.Fatalf("Discord project = %q", got)
 	}
-	var result map[string]any
-	if err := json.Unmarshal(persisted, &result); err != nil {
-		t.Fatal(err)
+	if accepted, err := stateStore.AcceptEvent("discord:123", nil, nil); err != nil || !accepted {
+		t.Fatalf("first AcceptEvent = %v, %v", accepted, err)
 	}
-	if result["version"] != float64(3) {
-		t.Fatalf("persisted version = %#v", result["version"])
+	if accepted, err := stateStore.AcceptEvent("discord:123", nil, nil); err != nil || accepted {
+		t.Fatalf("duplicate AcceptEvent = %v, %v", accepted, err)
 	}
 }

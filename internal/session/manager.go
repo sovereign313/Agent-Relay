@@ -4,6 +4,8 @@ import (
 	"context"
 	"errors"
 	"sync"
+
+	"github.com/sovereign313/Agent-Relay/internal/transport"
 )
 
 var (
@@ -12,7 +14,7 @@ var (
 )
 
 type Key struct {
-	ChatID    int64
+	Address   transport.Address
 	ProjectID string
 	AgentName string
 }
@@ -102,12 +104,12 @@ func (m *Manager) Cancel(key Key) bool {
 	return true
 }
 
-func (m *Manager) CancelChat(chatID int64) int {
+func (m *Manager) CancelAddress(address transport.Address) int {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	cancelled := 0
 	for key, current := range m.workers {
-		if key.ChatID != chatID || !current.working || current.activeCancel == nil {
+		if key.Address != address || !current.working || current.activeCancel == nil {
 			continue
 		}
 		current.activeCancel()

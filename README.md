@@ -4,17 +4,17 @@
 [![Go Version](https://img.shields.io/badge/Go-1.23%2B-00ADD8?logo=go&logoColor=white)](https://go.dev/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
-Agent Relay lets an authorized Telegram user run Codex, Claude Code, OpenCode,
-or Grok Build against Git repositories on a Linux PC. Each Telegram chat,
-project, and agent gets its own durable session, so switching tools or projects
-and returning later resumes the correct conversation.
+Agent Relay lets an authorized Telegram or Discord user run Codex, Claude Code,
+OpenCode, or Grok Build against Git repositories on a Linux PC. Each transport
+conversation, project, and agent gets its own durable session, so switching
+tools or projects and returning later resumes the correct conversation.
 
-Agent Relay uses Telegram long polling. It does not expose an inbound port and
-does not scrape a TUI. Each agent runs through its supported headless JSON
-interface and explicit session-resume flag. Telegram updates enter a durable
-local inbox before an agent starts. Completed
-responses move atomically into a durable outbox and remain there until Telegram
-accepts delivery.
+Agent Relay uses Telegram long polling and Discord's outbound Gateway
+connection. Neither transport needs a webhook or inbound port. Agent Relay does
+not scrape a TUI; each agent runs through its supported headless JSON interface
+and explicit session-resume flag. Inbound tasks enter a durable local inbox
+before an agent starts. Completed responses move atomically into a durable
+outbox and remain there until their transport accepts delivery.
 
 ## Security
 
@@ -30,13 +30,12 @@ Grok:     --always-approve
 
 The selected agent can therefore read, modify, execute, and access anything
 available to the OS user running Agent Relay. The configured project roots
-restrict which working directory a Telegram user may select; they are not an
-execution sandbox. Treat the Telegram bot token and every allowed Telegram
-account like an SSH key.
+restrict which working directory a remote user may select; they are not an
+execution sandbox. Treat bot tokens and every allowed account like an SSH key.
 
 For stronger isolation, run Agent Relay as a dedicated OS user or inside a
-container with only the intended project tree mounted writable. Use private
-Telegram chats, keep the allowlist short, and protect the configuration, agent
+container with only the intended project tree mounted writable. Keep transports
+private, keep each allowlist short, and protect the configuration, agent
 credentials, state file, and logs with restrictive permissions.
 
 ## Requirements
@@ -49,7 +48,7 @@ credentials, state file, and logs with restrictive permissions.
   [OpenCode](https://opencode.ai/docs/cli/), or
   [Grok Build](https://docs.x.ai/build/overview)
 - Git repositories beneath one or more configured project roots
-- A Telegram bot token
+- A Telegram bot token, a Discord bot token, or both
 
 Verify the CLIs you plan to enable before starting:
 
@@ -72,6 +71,22 @@ grok version
 Agent Relay logs unauthorized user and non-private-chat attempts without logging
 message bodies or the bot token.
 
+## Discord Setup
+
+1. Create an application in the
+   [Discord Developer Portal](https://discord.com/developers/applications).
+2. Add a bot, retain its token, and enable the Message Content intent.
+3. Install the bot to a server you control so you can open its profile and send
+   it a direct message.
+4. In Discord Developer Mode, right-click your account, select **Copy User ID**,
+   and add the string ID to `discord.allowed_user_ids`.
+5. Enable the transport, start Agent Relay, then send the bot `!help`.
+
+Discord uses the Gateway WebSocket initiated by Agent Relay. No interactions
+webhook URL, public HTTP endpoint, or inbound firewall rule is required. Direct
+messages are required by default. Set `private_channels_only = false` only when
+you intentionally want allowlisted users to operate the bot in server channels.
+
 ## Configuration
 
 Copy `config.example.toml` to `config.toml` and update the token, user ID, roots,
@@ -92,6 +107,12 @@ log_backups = 3
 queue_size = 5
 max_message_bytes = 32768
 task_timeout = "2h"
+
+[discord]
+enabled = false
+token_env = "AGENT_RELAY_DISCORD_TOKEN"
+allowed_user_ids = ["123456789012345678"]
+private_channels_only = true
 
 [project_aliases]
 harness-studio = "WaspLogic/HarnessStudio"
@@ -137,27 +158,33 @@ chmod 600 config.toml
 ```
 
 Agent Relay rejects a plaintext-token config that is accessible by group or
-others. To keep the token out of TOML, replace `telegram_token` with:
+others. To keep tokens out of TOML, use environment-variable settings:
 
 ```toml
 telegram_token_env = "AGENT_RELAY_TELEGRAM_TOKEN"
+
+[discord]
+enabled = true
+token_env = "AGENT_RELAY_DISCORD_TOKEN"
+allowed_user_ids = ["123456789012345678"]
 ```
 
-Then export that variable in the daemon's environment. Configuration files
-using only `telegram_token_env` may be non-secret and do not require mode
-`0600`. Agent Relay removes that named variable from the environment inherited
-by all agent child processes.
+Then export the configured variables in the daemon's environment. Configuration
+files using only token environment variables may be non-secret and do not
+require mode `0600`. Agent Relay removes those named variables from the
+environment inherited by all agent child processes.
 
 Project aliases are relative to a configured root. Absolute paths and alias
 targets that escape a root are rejected. Without an alias, a repository's
 lowercase directory name is its project ID. Duplicate names receive IDs derived
 from their relative paths.
 
-The JSON state file records Telegram update offsets, selected projects and
-agents, agent session IDs, pending prompts, interrupted jobs, last responses,
-and undelivered Telegram messages. It therefore contains sensitive project
-instructions and uses mode `0600`. Full conversation history remains in each
-CLI's own data directory. Preserve both when migrating or backing up sessions.
+The JSON state file records transport conversation IDs, Telegram update offsets,
+processed Discord events, selected projects and agents, agent session IDs,
+pending prompts, interrupted jobs, last responses, and undelivered messages. It
+therefore contains sensitive project instructions and uses mode `0600`. Full
+conversation history remains in each CLI's own data directory. Preserve both
+when migrating or backing up sessions.
 
 ## Build and Run
 
@@ -186,7 +213,7 @@ nohup ./agent-relay run --config ./config.toml >./var/launcher.log 2>&1 &
 An OpenRC service example is provided at `init/agent-relay.openrc`. Adjust its
 user, paths, and agent credentials before installing it.
 
-## Telegram Commands
+## Bot Commands
 
 - `/projects` or `/list`: list discovered projects with selection buttons.
 - `/project <id>`: select a project and resume its existing context when present.
@@ -205,8 +232,10 @@ user, paths, and agent credentials before installing it.
 - `/help`: show command help.
 
 Normal text is queued for the selected project and agent. Each
-chat/project/agent queue is bounded, and tasks targeting the same canonical
-repository are serialized even when they come from different chats or agents.
+conversation/project/agent queue is bounded, and tasks targeting the same
+canonical repository are serialized even when they come from different
+transports, conversations, or agents. Telegram uses the commands exactly as
+shown. On Discord, replace `/` with `!`, such as `!project harness-studio`.
 
 If Agent Relay stops while an agent process is active, the job becomes
 `interrupted` on restart and is not automatically replayed. This prevents a
@@ -244,15 +273,16 @@ grok --no-auto-update --output-format json --cwd PROJECT_PATH \
   --always-approve --resume SESSION_ID --single "PROMPT"
 ```
 
-Only the adapter's final natural-language result is returned to Telegram. Tool
-events, diffs, reasoning, token usage, and command output are not forwarded.
+Only the adapter's final natural-language result is returned to the originating
+transport. Tool events, diffs, reasoning, token usage, and command output are
+not forwarded.
 Each adapter validates the CLI capabilities it depends on at daemon startup.
 CLI output protocols can change, so upgrades may require adapter fixture
 updates.
 
-Telegram delivery retries transient transport errors, rate limits, and server
-errors. A final response that still cannot be delivered remains in the outbox
-for periodic retry and is also available through `/last`.
+Transport clients handle their own transient errors. A final response that
+cannot be delivered remains in the outbox for periodic retry and is also
+available through `/last` or `!last`.
 
 ## Troubleshooting
 
@@ -272,6 +302,8 @@ for periodic retry and is also available through `/last`.
   disable its profile before starting the daemon.
 - **Telegram receives no response:** inspect structured logs, verify outbound
   HTTPS access to `api.telegram.org`, and run `validate`.
+- **Discord receives no response:** verify the bot token, Message Content
+  intent, copied user ID, outbound WebSocket access, and `discord.enabled`.
 - **Task will not stop:** `/cancel` sends `SIGINT` to the agent process group;
   after a grace period Go terminates a process that does not exit.
 
