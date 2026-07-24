@@ -83,3 +83,42 @@ project_roots = ["/tmp"]
 		t.Fatalf("token = %q", cfg.TelegramToken)
 	}
 }
+
+func TestLoadConfiguresMultipleAgents(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.toml")
+	data := `telegram_token = "secret"
+allowed_user_ids = [42]
+project_roots = ["/tmp"]
+default_agent = "claude"
+
+[agents.codex]
+type = "codex"
+command = "codex"
+
+[agents.claude]
+type = "claude"
+command = "claude"
+
+[agents.grok]
+type = "grok"
+command = "grok"
+enabled = false
+`
+	if err := os.WriteFile(path, []byte(data), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	enabled := cfg.EnabledAgents()
+	if cfg.DefaultAgent != "claude" || len(enabled) != 2 {
+		t.Fatalf("default = %q, enabled = %#v", cfg.DefaultAgent, enabled)
+	}
+	if enabled["claude"].Type != "claude" || !*enabled["claude"].FullAccess {
+		t.Fatalf("Claude config = %#v", enabled["claude"])
+	}
+	if _, ok := enabled["grok"]; ok {
+		t.Fatal("disabled Grok agent was enabled")
+	}
+}

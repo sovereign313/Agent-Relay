@@ -11,7 +11,7 @@ Report suspected vulnerabilities through
 Do not include secrets in a public issue.
 
 Include the affected commit or version, impact, reproduction steps, and any
-suggested mitigation. Sanitize Telegram tokens, Codex credentials, prompts,
+suggested mitigation. Sanitize Telegram tokens, agent credentials, prompts,
 logs, paths, and private repository content.
 
 ## Deployment Expectations
@@ -21,8 +21,8 @@ logs, paths, and private repository content.
 - Prefer `telegram_token_env` over storing the bot token in TOML.
 - Run under a dedicated OS user with access only to intended project roots.
 - Treat `full_access = true` as unrestricted command execution by that OS user.
-- Keep configuration, state, logs, and Codex session data private.
+- Keep configuration, state, logs, and agent session data private.
 - Review interrupted work before explicitly retrying it.
 
 Project-root selection is an input restriction, not a security sandbox. Host or
-container isolation is required when Codex must not reach other data.
+container isolation is required when coding agents must not reach other data.

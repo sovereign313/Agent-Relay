@@ -10,7 +10,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/sovereign313/Agent-Relay/internal/codex"
+	"github.com/sovereign313/Agent-Relay/internal/agent"
 	"github.com/sovereign313/Agent-Relay/internal/config"
 	"github.com/sovereign313/Agent-Relay/internal/project"
 	"github.com/sovereign313/Agent-Relay/internal/session"
@@ -30,19 +30,19 @@ type Service struct {
 	log      *slog.Logger
 	telegram Telegram
 	store    *store.Store
-	runner   codex.Runner
+	runners  map[string]agent.Runner
 	sessions *session.Manager
 
 	catalogMu sync.RWMutex
 	catalog   *project.Catalog
 
-	dispatchMu   sync.Mutex
-	dispatched   map[int64]bool
-	deliveryMu   sync.Mutex
-	outboxWake   chan struct{}
-	startedAt    time.Time
-	version      string
-	codexVersion string
+	dispatchMu    sync.Mutex
+	dispatched    map[int64]bool
+	deliveryMu    sync.Mutex
+	outboxWake    chan struct{}
+	startedAt     time.Time
+	version       string
+	agentVersions map[string]string
 }
 
 func New(
@@ -52,22 +52,22 @@ func New(
 	client Telegram,
 	stateStore *store.Store,
 	catalog *project.Catalog,
-	runner codex.Runner,
+	runners map[string]agent.Runner,
 	version string,
-	codexVersion string,
+	agentVersions map[string]string,
 ) *Service {
 	service := &Service{
-		cfg:          cfg,
-		log:          logger,
-		telegram:     client,
-		store:        stateStore,
-		catalog:      catalog,
-		runner:       runner,
-		dispatched:   make(map[int64]bool),
-		outboxWake:   make(chan struct{}, 1),
-		startedAt:    time.Now().UTC(),
-		version:      version,
-		codexVersion: codexVersion,
+		cfg:           cfg,
+		log:           logger,
+		telegram:      client,
+		store:         stateStore,
+		catalog:       catalog,
+		runners:       runners,
+		dispatched:    make(map[int64]bool),
+		outboxWake:    make(chan struct{}, 1),
+		startedAt:     time.Now().UTC(),
+		version:       version,
+		agentVersions: agentVersions,
 	}
 	service.sessions = session.NewManager(ctx, cfg.QueueSize, service.process)
 	return service
@@ -83,7 +83,7 @@ func (s *Service) Run(ctx context.Context) error {
 		message := store.OutboxMessage{
 			ID:        fmt.Sprintf("interrupted:%d", job.ID),
 			ChatID:    job.ChatID,
-			Text:      fmt.Sprintf("Job %d in %s was interrupted by an Agent Relay restart. Use /retry %d to run it again or /clearqueue to discard it.", job.ID, job.ProjectID, job.ID),
+			Text:      fmt.Sprintf("Job %d for %s in %s was interrupted by an Agent Relay restart. Select that project and agent, then use /retry %d to run it again or /clearqueue to discard it.", job.ID, job.AgentName, job.ProjectID, job.ID),
 			CreatedAt: time.Now().UTC(),
 		}
 		if err := s.store.PutOutbox(message); err != nil {
@@ -176,6 +176,14 @@ func (s *Service) handleCommand(ctx context.Context, chatID int64, text string) 
 		s.send(chatID, helpText)
 	case "/projects", "/list":
 		s.sendProjects(chatID)
+	case "/agents":
+		s.sendAgents(chatID)
+	case "/agent":
+		if len(fields) != 2 {
+			s.send(chatID, "Usage: /agent <agent-name>")
+			return
+		}
+		s.selectAgent(chatID, fields[1])
 	case "/project", "/use":
 		if len(fields) != 2 {
 			s.send(chatID, "Usage: /project <project-id>")
@@ -240,17 +248,26 @@ func (s *Service) handleCallback(update telegram.Update) error {
 	if err != nil || !accepted {
 		return err
 	}
-	if !strings.HasPrefix(callback.Data, "project:") {
+	switch {
+	case strings.HasPrefix(callback.Data, "project:"):
+		projectID := strings.TrimPrefix(callback.Data, "project:")
+		if _, ok := s.getProject(projectID); !ok {
+			s.answerCallback(callback.ID, "Project unavailable")
+			return nil
+		}
+		s.selectProject(callback.Message.Chat.ID, projectID)
+		s.answerCallback(callback.ID, "Selected "+projectID)
+	case strings.HasPrefix(callback.Data, "agent:"):
+		agentName := strings.TrimPrefix(callback.Data, "agent:")
+		if _, ok := s.runners[agentName]; !ok {
+			s.answerCallback(callback.ID, "Agent unavailable")
+			return nil
+		}
+		s.selectAgent(callback.Message.Chat.ID, agentName)
+		s.answerCallback(callback.ID, "Selected "+agentName)
+	default:
 		s.answerCallback(callback.ID, "Unknown action")
-		return nil
 	}
-	projectID := strings.TrimPrefix(callback.Data, "project:")
-	if _, ok := s.getProject(projectID); !ok {
-		s.answerCallback(callback.ID, "Project unavailable")
-		return nil
-	}
-	s.selectProject(callback.Message.Chat.ID, projectID)
-	s.answerCallback(callback.ID, "Selected "+projectID)
 	return nil
 }
 
@@ -265,10 +282,34 @@ func (s *Service) selectProject(chatID int64, id string) {
 		s.send(chatID, "Could not save the selected project.")
 		return
 	}
-	if conversation, exists := s.store.Conversation(chatID, selected.ID); exists && conversation.ThreadID != "" {
-		s.send(chatID, "Selected "+selected.ID+". Existing Codex context will be resumed.")
+	agentName := s.selectedAgent(chatID)
+	if conversation, exists := s.store.Conversation(chatID, selected.ID, agentName); exists && conversation.ThreadID != "" {
+		s.send(chatID, "Selected "+selected.ID+". Existing "+agentName+" context will be resumed.")
 	} else {
-		s.send(chatID, "Selected "+selected.ID+". The next message starts a new Codex context.")
+		s.send(chatID, "Selected "+selected.ID+". The next message starts a new "+agentName+" context.")
+	}
+}
+
+func (s *Service) selectAgent(chatID int64, name string) {
+	name = strings.ToLower(strings.TrimSpace(name))
+	if _, ok := s.runners[name]; !ok {
+		s.send(chatID, "Unknown agent. Run /agents to list available agents.")
+		return
+	}
+	if err := s.store.SetSelectedAgent(chatID, name); err != nil {
+		s.log.Error("persist selected agent", "error_type", fmt.Sprintf("%T", err))
+		s.send(chatID, "Could not save the selected agent.")
+		return
+	}
+	projectID := s.store.SelectedProject(chatID)
+	if projectID == "" {
+		s.send(chatID, "Selected "+name+". Select a project with /projects.")
+		return
+	}
+	if conversation, exists := s.store.Conversation(chatID, projectID, name); exists && conversation.ThreadID != "" {
+		s.send(chatID, "Selected "+name+". Existing context for "+projectID+" will be resumed.")
+	} else {
+		s.send(chatID, "Selected "+name+". The next message starts a new context for "+projectID+".")
 	}
 }
 
@@ -278,30 +319,29 @@ func (s *Service) newConversation(chatID int64) {
 		s.send(chatID, "Select a project first with /project <project-id>.")
 		return
 	}
-	key := session.Key{ChatID: chatID, ProjectID: projectID}
+	agentName := s.selectedAgent(chatID)
+	key := session.Key{ChatID: chatID, ProjectID: projectID, AgentName: agentName}
 	status := s.sessions.Status(key)
-	if status.Working || status.Queued > 0 || s.hasPersistedJobs(chatID, projectID) {
+	if status.Working || status.Queued > 0 || s.hasPersistedJobs(chatID, projectID, agentName) {
 		s.send(chatID, "Cancel the active task and wait for the queue to clear before starting a new context.")
 		return
 	}
-	if conversation, exists := s.store.Conversation(chatID, projectID); exists && conversation.ThreadID != "" {
-		if archiver, ok := s.runner.(interface {
-			Archive(context.Context, string) error
-		}); ok {
+	if conversation, exists := s.store.Conversation(chatID, projectID, agentName); exists && conversation.ThreadID != "" {
+		if resetter, ok := s.runners[agentName].(agent.Resetter); ok {
 			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-			err := archiver.Archive(ctx, conversation.ThreadID)
+			err := resetter.Reset(ctx, conversation.ThreadID)
 			cancel()
 			if err != nil {
-				s.log.Warn("archive old Codex thread failed", "project", projectID, "error_type", fmt.Sprintf("%T", err))
+				s.log.Warn("reset old agent session failed", "agent", agentName, "project", projectID, "error_type", fmt.Sprintf("%T", err))
 			}
 		}
 	}
-	if err := s.store.DeleteConversation(chatID, projectID); err != nil {
+	if err := s.store.DeleteConversation(chatID, projectID, agentName); err != nil {
 		s.log.Error("delete conversation", "error", err)
-		s.send(chatID, "Could not reset the Codex context.")
+		s.send(chatID, "Could not reset the "+agentName+" context.")
 		return
 	}
-	s.send(chatID, "The next message will start a new Codex context for "+projectID+".")
+	s.send(chatID, "The next message will start a new "+agentName+" context for "+projectID+".")
 }
 
 func (s *Service) cancel(chatID int64) {
@@ -310,11 +350,12 @@ func (s *Service) cancel(chatID int64) {
 		s.send(chatID, "No project is selected.")
 		return
 	}
-	if !s.sessions.Cancel(session.Key{ChatID: chatID, ProjectID: projectID}) {
-		s.send(chatID, "Codex is not currently working in "+projectID+".")
+	agentName := s.selectedAgent(chatID)
+	if !s.sessions.Cancel(session.Key{ChatID: chatID, ProjectID: projectID, AgentName: agentName}) {
+		s.send(chatID, agentName+" is not currently working in "+projectID+".")
 		return
 	}
-	if conversation, exists := s.store.Conversation(chatID, projectID); exists {
+	if conversation, exists := s.store.Conversation(chatID, projectID, agentName); exists {
 		conversation.State = store.StateStopped
 		conversation.LastActivity = time.Now().UTC()
 		conversation.LastError = "cancellation requested"
@@ -322,16 +363,16 @@ func (s *Service) cancel(chatID int64) {
 			s.log.Error("persist cancellation state", "error_type", fmt.Sprintf("%T", err))
 		}
 	}
-	s.send(chatID, "Cancelling the current Codex task...")
+	s.send(chatID, "Cancelling the current "+agentName+" task...")
 }
 
 func (s *Service) cancelAll(chatID int64) {
 	count := s.sessions.CancelChat(chatID)
 	if count == 0 {
-		s.send(chatID, "No Codex tasks are currently running.")
+		s.send(chatID, "No agent tasks are currently running.")
 		return
 	}
-	s.send(chatID, fmt.Sprintf("Cancelling %d running Codex task(s)...", count))
+	s.send(chatID, fmt.Sprintf("Cancelling %d running agent task(s)...", count))
 }
 
 func (s *Service) clearQueue(chatID int64) {
@@ -340,7 +381,8 @@ func (s *Service) clearQueue(chatID int64) {
 		s.send(chatID, "No project is selected.")
 		return
 	}
-	key := session.Key{ChatID: chatID, ProjectID: projectID}
+	agentName := s.selectedAgent(chatID)
+	key := session.Key{ChatID: chatID, ProjectID: projectID, AgentName: agentName}
 	status := s.sessions.Status(key)
 	excludeID := int64(-1)
 	if status.Working {
@@ -350,7 +392,7 @@ func (s *Service) clearQueue(chatID int64) {
 	for _, job := range removedMemory {
 		s.markDispatched(job.ID, false)
 	}
-	removed, err := s.store.ClearJobs(chatID, projectID, excludeID)
+	removed, err := s.store.ClearJobs(chatID, projectID, agentName, excludeID)
 	if err != nil {
 		s.log.Error("clear persisted jobs", "error_type", fmt.Sprintf("%T", err))
 		s.send(chatID, "Could not clear the persisted queue.")
@@ -360,13 +402,13 @@ func (s *Service) clearQueue(chatID int64) {
 		s.markDispatched(id, false)
 	}
 	if !status.Working {
-		if conversation, exists := s.store.Conversation(chatID, projectID); exists && conversation.State == store.StateQueued {
+		if conversation, exists := s.store.Conversation(chatID, projectID, agentName); exists && conversation.State == store.StateQueued {
 			conversation.State = store.StateIdle
 			conversation.LastActivity = time.Now().UTC()
 			_ = s.store.PutConversation(conversation)
 		}
 	}
-	s.send(chatID, fmt.Sprintf("Cleared %d queued or interrupted job(s) from %s.", len(removed), projectID))
+	s.send(chatID, fmt.Sprintf("Cleared %d queued or interrupted %s job(s) from %s.", len(removed), agentName, projectID))
 }
 
 func (s *Service) retryJob(chatID, jobID int64) {
@@ -379,12 +421,16 @@ func (s *Service) retryJob(chatID, jobID int64) {
 		s.send(chatID, "Select "+job.ProjectID+" before retrying this job.")
 		return
 	}
+	if selected := s.selectedAgent(chatID); selected != job.AgentName {
+		s.send(chatID, "Select "+job.AgentName+" with /agent before retrying this job.")
+		return
+	}
 	job, err := s.store.RetryJob(jobID)
 	if err != nil {
 		s.send(chatID, safeError(err))
 		return
 	}
-	if conversation, exists := s.store.Conversation(chatID, job.ProjectID); exists {
+	if conversation, exists := s.store.Conversation(chatID, job.ProjectID, job.AgentName); exists {
 		conversation.State = store.StateQueued
 		conversation.LastActivity = time.Now().UTC()
 		conversation.LastError = ""
@@ -400,7 +446,7 @@ func (s *Service) retryJob(chatID, jobID int64) {
 	if queued {
 		s.send(chatID, fmt.Sprintf("Job %d was queued.", jobID))
 	} else {
-		s.send(chatID, fmt.Sprintf("Retrying job %d in %s...", jobID, job.ProjectID))
+		s.send(chatID, fmt.Sprintf("Retrying job %d with %s in %s...", jobID, job.AgentName, job.ProjectID))
 	}
 }
 
@@ -410,9 +456,10 @@ func (s *Service) sendLast(chatID int64) {
 		s.send(chatID, "No project is selected.")
 		return
 	}
-	conversation, exists := s.store.Conversation(chatID, projectID)
+	agentName := s.selectedAgent(chatID)
+	conversation, exists := s.store.Conversation(chatID, projectID, agentName)
 	if !exists || conversation.LastResponse == "" {
-		s.send(chatID, "No completed Codex response is stored for "+projectID+".")
+		s.send(chatID, "No completed "+agentName+" response is stored for "+projectID+".")
 		return
 	}
 	s.send(chatID, conversation.LastResponse)
@@ -462,10 +509,49 @@ func (s *Service) sendProjects(chatID int64) {
 	}
 }
 
+func (s *Service) agentsMessage(chatID int64) string {
+	selected := s.selectedAgent(chatID)
+	names := make([]string, 0, len(s.runners))
+	for name := range s.runners {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	lines := []string{"Agents:"}
+	for _, name := range names {
+		marker := "  "
+		if name == selected {
+			marker = "* "
+		}
+		lines = append(lines, marker+name+" — "+s.agentVersions[name])
+	}
+	return strings.Join(lines, "\n")
+}
+
+func (s *Service) sendAgents(chatID int64) {
+	names := make([]string, 0, len(s.runners))
+	for name := range s.runners {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	rows := make([][]telegram.Button, 0, (len(names)+1)/2)
+	for index := 0; index < len(names); index += 2 {
+		row := []telegram.Button{{Text: names[index], Data: "agent:" + names[index]}}
+		if index+1 < len(names) {
+			row = append(row, telegram.Button{Text: names[index+1], Data: "agent:" + names[index+1]})
+		}
+		rows = append(rows, row)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	if err := s.telegram.SendKeyboard(ctx, chatID, s.agentsMessage(chatID), rows); err != nil {
+		s.log.Error("send agent keyboard", "chat_id", chatID, "error_type", fmt.Sprintf("%T", err))
+	}
+}
+
 func (s *Service) sessionsMessage(chatID int64) string {
 	conversations := s.store.Conversations(chatID)
 	if len(conversations) == 0 {
-		return "No Codex project sessions have been created."
+		return "No agent project sessions have been created."
 	}
 	sort.Slice(conversations, func(i, j int) bool {
 		return conversations[i].LastActivity.After(conversations[j].LastActivity)
@@ -476,7 +562,7 @@ func (s *Service) sessionsMessage(chatID int64) string {
 		if conversation.ThreadID != "" {
 			thread = shortID(conversation.ThreadID)
 		}
-		lines = append(lines, fmt.Sprintf("%s — %s — %s", conversation.ProjectID, conversation.State, thread))
+		lines = append(lines, fmt.Sprintf("%s — %s — %s — %s", conversation.ProjectID, conversation.AgentName, conversation.State, thread))
 	}
 	return strings.Join(lines, "\n")
 }
@@ -486,16 +572,17 @@ func (s *Service) queueMessage(chatID int64) string {
 	if projectID == "" {
 		return "No project is selected."
 	}
+	agentName := s.selectedAgent(chatID)
 	var jobs []store.PendingJob
 	for _, job := range s.store.Jobs() {
-		if job.ChatID == chatID && job.ProjectID == projectID {
+		if job.ChatID == chatID && job.ProjectID == projectID && job.AgentName == agentName {
 			jobs = append(jobs, job)
 		}
 	}
 	if len(jobs) == 0 {
-		return "The queue for " + projectID + " is empty."
+		return "The " + agentName + " queue for " + projectID + " is empty."
 	}
-	lines := []string{"Queue for " + projectID + ":"}
+	lines := []string{"Queue for " + projectID + " with " + agentName + ":"}
 	for _, job := range jobs {
 		preview := strings.Join(strings.Fields(job.Prompt), " ")
 		if len(preview) > 72 {
@@ -507,10 +594,12 @@ func (s *Service) queueMessage(chatID int64) string {
 }
 
 func (s *Service) statusMessage(chatID int64) string {
+	agentName := s.selectedAgent(chatID)
 	runtime := fmt.Sprintf(
-		"Agent Relay: %s\nCodex: %s\nUptime: %s",
+		"Agent Relay: %s\nAgent: %s (%s)\nUptime: %s",
 		s.version,
-		s.codexVersion,
+		agentName,
+		s.agentVersions[agentName],
 		formatUptime(time.Since(s.startedAt)),
 	)
 	projectID := s.store.SelectedProject(chatID)
@@ -521,8 +610,8 @@ func (s *Service) statusMessage(chatID int64) string {
 	if !ok {
 		return runtime + "\nProject: " + projectID + "\nState: unavailable"
 	}
-	conversation, exists := s.store.Conversation(chatID, projectID)
-	status := s.sessions.Status(session.Key{ChatID: chatID, ProjectID: projectID})
+	conversation, exists := s.store.Conversation(chatID, projectID, agentName)
+	status := s.sessions.Status(session.Key{ChatID: chatID, ProjectID: projectID, AgentName: agentName})
 	state := store.StateIdle
 	thread := "not started"
 	if exists {
@@ -538,7 +627,7 @@ func (s *Service) statusMessage(chatID int64) string {
 	}
 	durableJobs := 0
 	for _, job := range s.store.Jobs() {
-		if job.ChatID == chatID && job.ProjectID == projectID {
+		if job.ChatID == chatID && job.ProjectID == projectID && job.AgentName == agentName {
 			durableJobs++
 		}
 	}
@@ -580,4 +669,12 @@ func (s *Service) listProjects() []project.Project {
 	s.catalogMu.RLock()
 	defer s.catalogMu.RUnlock()
 	return s.catalog.List()
+}
+
+func (s *Service) selectedAgent(chatID int64) string {
+	name := s.store.SelectedAgent(chatID)
+	if _, ok := s.runners[name]; ok {
+		return name
+	}
+	return s.cfg.DefaultAgent
 }

@@ -11,7 +11,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/sovereign313/Agent-Relay/internal/codex"
+	"github.com/sovereign313/Agent-Relay/internal/agent"
 	"github.com/sovereign313/Agent-Relay/internal/config"
 	"github.com/sovereign313/Agent-Relay/internal/project"
 	"github.com/sovereign313/Agent-Relay/internal/store"
@@ -58,9 +58,9 @@ state_file = "./state.json"
 		fakeTelegram,
 		stateStore,
 		catalog,
-		fakeRunner,
+		map[string]agent.Runner{"codex": fakeRunner},
 		"test",
-		"codex-test",
+		map[string]string{"codex": "codex-test"},
 	)
 	defer service.sessions.Close()
 
@@ -93,11 +93,11 @@ state_file = "./state.json"
 	if requests[1].ThreadID != "thread-alpha" {
 		t.Fatalf("second request thread = %q, want thread-alpha", requests[1].ThreadID)
 	}
-	if conversation, ok := stateStore.Conversation(42, "alpha"); !ok || conversation.ThreadID != "thread-alpha" {
+	if conversation, ok := stateStore.Conversation(42, "alpha", "codex"); !ok || conversation.ThreadID != "thread-alpha" {
 		t.Fatalf("persisted conversation = %#v, %v", conversation, ok)
 	}
 
-	conversation, _ := stateStore.Conversation(42, "alpha")
+	conversation, _ := stateStore.Conversation(42, "alpha", "codex")
 	conversation.ProjectPath = "/old/project/path"
 	if err := stateStore.PutConversation(conversation); err != nil {
 		t.Fatal(err)
@@ -115,6 +115,76 @@ state_file = "./state.json"
 	service.deliverOutbox(ctx)
 	if outbox := stateStore.Outbox(); len(outbox) != 0 {
 		t.Fatalf("delivered outbox still contains %#v", outbox)
+	}
+}
+
+func TestServiceKeepsAgentSessionsSeparate(t *testing.T) {
+	root := t.TempDir()
+	repo := filepath.Join(root, "Alpha")
+	if err := os.MkdirAll(filepath.Join(repo, ".git"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	configPath := filepath.Join(root, "config.toml")
+	configData := `telegram_token = "test-token"
+allowed_user_ids = [42]
+project_roots = ["` + root + `"]
+state_file = "./state.json"
+
+[agents.codex]
+type = "codex"
+
+[agents.claude]
+type = "claude"
+`
+	if err := os.WriteFile(configPath, []byte(configData), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := config.Load(configPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	catalog, err := project.Discover([]string{root}, nil, cfg.ProjectDiscoveryDepth)
+	if err != nil {
+		t.Fatal(err)
+	}
+	stateStore, err := store.Open(filepath.Join(root, "state.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	codexRunner := &recordingRunner{called: make(chan struct{}, 2), newThread: "codex-thread"}
+	claudeRunner := &recordingRunner{called: make(chan struct{}, 1), newThread: "claude-thread"}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	service := New(
+		ctx, cfg, slog.New(slog.NewTextHandler(io.Discard, nil)), &recordingTelegram{},
+		stateStore, catalog,
+		map[string]agent.Runner{"codex": codexRunner, "claude": claudeRunner},
+		"test", map[string]string{"codex": "test", "claude": "test"},
+	)
+	defer service.sessions.Close()
+
+	updates := []string{"/project alpha", "codex one", "/agent claude", "claude one", "/agent codex", "codex two"}
+	for index, message := range updates {
+		if err := service.handleUpdate(ctx, textUpdate(int64(index+1), message)); err != nil {
+			t.Fatal(err)
+		}
+		if message == "codex one" || message == "codex two" {
+			waitCall(t, codexRunner.called)
+			waitForState(t, stateStore, 42, "alpha", "codex", store.StateIdle)
+		}
+		if message == "claude one" {
+			waitCall(t, claudeRunner.called)
+			waitForState(t, stateStore, 42, "alpha", "claude", store.StateIdle)
+		}
+	}
+
+	codexRequests := codexRunner.Requests()
+	claudeRequests := claudeRunner.Requests()
+	if len(codexRequests) != 2 || codexRequests[0].ThreadID != "" || codexRequests[1].ThreadID != "codex-thread" {
+		t.Fatalf("Codex requests = %#v", codexRequests)
+	}
+	if len(claudeRequests) != 1 || claudeRequests[0].ThreadID != "" {
+		t.Fatalf("Claude requests = %#v", claudeRequests)
 	}
 }
 
@@ -143,32 +213,40 @@ func (t *recordingTelegram) AnswerCallback(context.Context, string, string) erro
 }
 
 type recordingRunner struct {
-	mu       sync.Mutex
-	requests []codex.Request
-	called   chan struct{}
+	mu        sync.Mutex
+	requests  []agent.Request
+	called    chan struct{}
+	newThread string
 }
 
-func (r *recordingRunner) Run(_ context.Context, request codex.Request) (codex.Result, error) {
+func (r *recordingRunner) Validate(context.Context) (string, error) {
+	return "test", nil
+}
+
+func (r *recordingRunner) Run(_ context.Context, request agent.Request) (agent.Result, error) {
 	r.mu.Lock()
 	r.requests = append(r.requests, request)
 	r.mu.Unlock()
 	threadID := request.ThreadID
 	if threadID == "" {
-		threadID = "thread-alpha"
+		threadID = r.newThread
+		if threadID == "" {
+			threadID = "thread-alpha"
+		}
 		if request.OnThread != nil {
 			if err := request.OnThread(threadID); err != nil {
-				return codex.Result{}, err
+				return agent.Result{}, err
 			}
 		}
 	}
 	r.called <- struct{}{}
-	return codex.Result{ThreadID: threadID, FinalMessage: "done"}, nil
+	return agent.Result{ThreadID: threadID, FinalMessage: "done"}, nil
 }
 
-func (r *recordingRunner) Requests() []codex.Request {
+func (r *recordingRunner) Requests() []agent.Request {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	return append([]codex.Request(nil), r.requests...)
+	return append([]agent.Request(nil), r.requests...)
 }
 
 func textUpdate(id int64, text string) telegram.Update {
@@ -191,17 +269,28 @@ func waitCall(t *testing.T, called <-chan struct{}) {
 	}
 }
 
-func waitForState(t *testing.T, stateStore *store.Store, chatID int64, projectID string, want store.SessionState) {
+func waitForState(t *testing.T, stateStore *store.Store, chatID int64, projectID string, arguments ...any) {
 	t.Helper()
+	agentName := "codex"
+	var want store.SessionState
+	switch len(arguments) {
+	case 1:
+		want = arguments[0].(store.SessionState)
+	case 2:
+		agentName = arguments[0].(string)
+		want = arguments[1].(store.SessionState)
+	default:
+		t.Fatal("waitForState requires state or agent and state")
+	}
 	deadline := time.Now().Add(time.Second)
 	for time.Now().Before(deadline) {
-		conversation, ok := stateStore.Conversation(chatID, projectID)
+		conversation, ok := stateStore.Conversation(chatID, projectID, agentName)
 		if ok && conversation.State == want {
 			return
 		}
 		time.Sleep(time.Millisecond)
 	}
-	conversation, _ := stateStore.Conversation(chatID, projectID)
+	conversation, _ := stateStore.Conversation(chatID, projectID, agentName)
 	t.Fatalf("conversation state = %q, want %q", conversation.State, want)
 }
 

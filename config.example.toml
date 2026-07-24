@@ -9,6 +9,7 @@ allowed_user_ids = [
 private_chats_only = true
 project_roots = ["/mnt/external/projects"]
 project_discovery_depth = 5
+default_agent = "codex"
 state_file = "./var/state.json"
 log_file = "./var/agent-relay.log"
 log_max_bytes = 10485760
@@ -21,7 +22,29 @@ task_timeout = "2h"
 harness-studio = "WaspLogic/HarnessStudio"
 rapidrfq = "WaspLogic/RapidRFQ"
 
-[codex]
+[agents.codex]
+type = "codex"
 command = "codex"
 args = []
 full_access = true
+
+[agents.claude]
+type = "claude"
+command = "claude"
+args = []
+full_access = true
+enabled = false
+
+[agents.opencode]
+type = "opencode"
+command = "opencode"
+args = []
+full_access = true
+enabled = false
+
+[agents.grok]
+type = "grok"
+command = "grok"
+args = []
+full_access = true
+enabled = false

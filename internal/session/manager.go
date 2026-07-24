@@ -14,12 +14,14 @@ var (
 type Key struct {
 	ChatID    int64
 	ProjectID string
+	AgentName string
 }
 
 type Job struct {
 	ID          int64
 	Key         Key
 	ProjectPath string
+	AgentName   string
 	Prompt      string
 }
 

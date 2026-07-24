@@ -8,12 +8,18 @@ import (
 	"io"
 	"os"
 	"os/signal"
+	"sort"
+	"strings"
 	"syscall"
 	"time"
 
+	"github.com/sovereign313/Agent-Relay/internal/agent"
+	"github.com/sovereign313/Agent-Relay/internal/claude"
 	"github.com/sovereign313/Agent-Relay/internal/codex"
 	"github.com/sovereign313/Agent-Relay/internal/config"
+	"github.com/sovereign313/Agent-Relay/internal/grok"
 	"github.com/sovereign313/Agent-Relay/internal/logging"
+	"github.com/sovereign313/Agent-Relay/internal/opencode"
 	"github.com/sovereign313/Agent-Relay/internal/project"
 	"github.com/sovereign313/Agent-Relay/internal/relay"
 	"github.com/sovereign313/Agent-Relay/internal/store"
@@ -51,14 +57,12 @@ func run(args []string, stdout, stderr io.Writer) error {
 		if err != nil {
 			return err
 		}
-		runner := newRunner(cfg)
-		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
-		codexVersion, err := runner.Validate(ctx)
-		cancel()
+		runners := newRunners(cfg)
+		versions, err := validateAgents(context.Background(), runners)
 		if err != nil {
 			return err
 		}
-		fmt.Fprintf(stdout, "Configuration is valid. Discovered %d projects. Codex: %s\n", len(catalog.List()), codexVersion)
+		fmt.Fprintf(stdout, "Configuration is valid. Discovered %d projects. Agents: %s\n", len(catalog.List()), formatAgentVersions(versions))
 		return nil
 	case "projects":
 		configPath, err := parseConfigFlag("projects", args[1:], stderr)
@@ -116,43 +120,94 @@ func runDaemon(configPath string) error {
 		return err
 	}
 	client := telegram.New(cfg.TelegramToken, cfg.TelegramAPIBase, nil)
-	runner := newRunner(cfg)
-	validateContext, validateCancel := context.WithTimeout(context.Background(), 15*time.Second)
-	codexVersion, err := runner.Validate(validateContext)
-	validateCancel()
+	runners := newRunners(cfg)
+	agentVersions, err := validateAgents(context.Background(), runners)
 	if err != nil {
 		return err
 	}
 
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
-	service := relay.New(ctx, cfg, logger, client, stateStore, catalog, runner, version, codexVersion)
+	service := relay.New(ctx, cfg, logger, client, stateStore, catalog, runners, version, agentVersions)
 	logger.Info(
 		"agent relay starting",
 		"version", version,
 		"projects", len(catalog.List()),
-		"full_access", *cfg.Codex.FullAccess,
-		"codex_version", codexVersion,
+		"agents", formatAgentVersions(agentVersions),
 	)
-	if *cfg.Codex.FullAccess {
-		logger.Warn("Codex Full Access is enabled; the relay can access everything available to its OS user")
+	for name, configured := range cfg.EnabledAgents() {
+		if *configured.FullAccess {
+			logger.Warn("agent Full Access is enabled; it can access everything available to its OS user", "agent", name)
+		}
 	}
 	err = service.Run(ctx)
 	logger.Info("agent relay stopped")
 	return err
 }
 
-func newRunner(cfg *config.Config) *codex.ExecRunner {
+func newRunners(cfg *config.Config) map[string]agent.Runner {
 	var removeEnv []string
 	if cfg.TelegramTokenEnv != "" {
 		removeEnv = append(removeEnv, cfg.TelegramTokenEnv)
 	}
-	return &codex.ExecRunner{
-		Command:    cfg.Codex.Command,
-		Args:       cfg.Codex.Args,
-		FullAccess: *cfg.Codex.FullAccess,
-		RemoveEnv:  removeEnv,
+	runners := make(map[string]agent.Runner)
+	for name, configured := range cfg.EnabledAgents() {
+		switch configured.Type {
+		case "codex":
+			runners[name] = &codex.ExecRunner{
+				Command: configured.Command, Args: configured.Args,
+				FullAccess: *configured.FullAccess, RemoveEnv: removeEnv,
+			}
+		case "claude":
+			runners[name] = &claude.Runner{
+				Command: configured.Command, Args: configured.Args,
+				FullAccess: *configured.FullAccess, RemoveEnv: removeEnv,
+			}
+		case "opencode":
+			runners[name] = &opencode.Runner{
+				Command: configured.Command, Args: configured.Args,
+				FullAccess: *configured.FullAccess, RemoveEnv: removeEnv,
+			}
+		case "grok":
+			runners[name] = &grok.Runner{
+				Command: configured.Command, Args: configured.Args,
+				FullAccess: *configured.FullAccess, RemoveEnv: removeEnv,
+			}
+		}
 	}
+	return runners
+}
+
+func validateAgents(parent context.Context, runners map[string]agent.Runner) (map[string]string, error) {
+	versions := make(map[string]string, len(runners))
+	names := make([]string, 0, len(runners))
+	for name := range runners {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	for _, name := range names {
+		ctx, cancel := context.WithTimeout(parent, 15*time.Second)
+		version, err := runners[name].Validate(ctx)
+		cancel()
+		if err != nil {
+			return nil, fmt.Errorf("validate agent %s: %w", name, err)
+		}
+		versions[name] = version
+	}
+	return versions, nil
+}
+
+func formatAgentVersions(versions map[string]string) string {
+	names := make([]string, 0, len(versions))
+	for name := range versions {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	parts := make([]string, 0, len(names))
+	for _, name := range names {
+		parts = append(parts, name+"="+versions[name])
+	}
+	return strings.Join(parts, ", ")
 }
 
 func loadRuntime(configPath string) (*config.Config, *project.Catalog, error) {

@@ -21,31 +21,35 @@ const (
 )
 
 type Config struct {
-	TelegramToken         string            `toml:"telegram_token"`
-	TelegramTokenEnv      string            `toml:"telegram_token_env"`
-	AllowedUserIDs        []int64           `toml:"allowed_user_ids"`
-	PrivateChatsOnly      *bool             `toml:"private_chats_only"`
-	ProjectRoots          []string          `toml:"project_roots"`
-	ProjectAliases        map[string]string `toml:"project_aliases"`
-	ProjectDiscoveryDepth int               `toml:"project_discovery_depth"`
-	StateFile             string            `toml:"state_file"`
-	LogFile               string            `toml:"log_file"`
-	LogMaxBytes           int64             `toml:"log_max_bytes"`
-	LogBackups            int               `toml:"log_backups"`
-	QueueSize             int               `toml:"queue_size"`
-	MaxMessageBytes       int               `toml:"max_message_bytes"`
-	TaskTimeout           string            `toml:"task_timeout"`
-	TelegramAPIBase       string            `toml:"telegram_api_base"`
-	Codex                 CodexConfig       `toml:"codex"`
+	TelegramToken         string                 `toml:"telegram_token"`
+	TelegramTokenEnv      string                 `toml:"telegram_token_env"`
+	AllowedUserIDs        []int64                `toml:"allowed_user_ids"`
+	PrivateChatsOnly      *bool                  `toml:"private_chats_only"`
+	ProjectRoots          []string               `toml:"project_roots"`
+	ProjectAliases        map[string]string      `toml:"project_aliases"`
+	ProjectDiscoveryDepth int                    `toml:"project_discovery_depth"`
+	DefaultAgent          string                 `toml:"default_agent"`
+	Agents                map[string]AgentConfig `toml:"agents"`
+	StateFile             string                 `toml:"state_file"`
+	LogFile               string                 `toml:"log_file"`
+	LogMaxBytes           int64                  `toml:"log_max_bytes"`
+	LogBackups            int                    `toml:"log_backups"`
+	QueueSize             int                    `toml:"queue_size"`
+	MaxMessageBytes       int                    `toml:"max_message_bytes"`
+	TaskTimeout           string                 `toml:"task_timeout"`
+	TelegramAPIBase       string                 `toml:"telegram_api_base"`
+	Codex                 AgentConfig            `toml:"codex"`
 
 	taskTimeout time.Duration
 	sourceDir   string
 }
 
-type CodexConfig struct {
+type AgentConfig struct {
+	Type       string   `toml:"type"`
 	Command    string   `toml:"command"`
 	Args       []string `toml:"args"`
 	FullAccess *bool    `toml:"full_access"`
+	Enabled    *bool    `toml:"enabled"`
 }
 
 func Load(path string) (*Config, error) {
@@ -108,16 +112,49 @@ func (c *Config) applyDefaults() {
 	if c.TelegramAPIBase == "" {
 		c.TelegramAPIBase = "https://api.telegram.org"
 	}
-	if c.Codex.Command == "" {
-		c.Codex.Command = "codex"
-	}
 	if c.PrivateChatsOnly == nil {
 		value := true
 		c.PrivateChatsOnly = &value
 	}
-	if c.Codex.FullAccess == nil {
-		value := true
-		c.Codex.FullAccess = &value
+	if len(c.Agents) == 0 {
+		legacy := c.Codex
+		legacy.Type = "codex"
+		if legacy.Command == "" {
+			legacy.Command = "codex"
+		}
+		c.Codex = legacy
+		c.Agents = map[string]AgentConfig{"codex": legacy}
+	}
+	for name, configured := range c.Agents {
+		if configured.Type == "" {
+			configured.Type = name
+		}
+		if configured.Command == "" {
+			configured.Command = configured.Type
+		}
+		if configured.FullAccess == nil {
+			value := true
+			configured.FullAccess = &value
+		}
+		if configured.Enabled == nil {
+			value := true
+			configured.Enabled = &value
+		}
+		c.Agents[name] = configured
+	}
+	if configured, ok := c.Agents["codex"]; ok {
+		c.Codex = configured
+	}
+	if c.DefaultAgent == "" {
+		if configured, ok := c.Agents["codex"]; ok && *configured.Enabled {
+			c.DefaultAgent = "codex"
+		} else {
+			for name, configured := range c.Agents {
+				if *configured.Enabled && (c.DefaultAgent == "" || name < c.DefaultAgent) {
+					c.DefaultAgent = name
+				}
+			}
+		}
 	}
 }
 
@@ -161,8 +198,28 @@ func (c *Config) Validate() error {
 			problems = append(problems, fmt.Errorf("project alias %q must use a path relative to a project root", alias))
 		}
 	}
-	if c.Codex.Command == "" {
-		problems = append(problems, errors.New("codex.command must not be empty"))
+	supported := map[string]bool{"codex": true, "claude": true, "opencode": true, "grok": true}
+	enabled := 0
+	for name, configured := range c.Agents {
+		if normalizeID(name) != name {
+			problems = append(problems, fmt.Errorf("agent name %q must use lowercase letters, numbers, and dashes", name))
+		}
+		if !supported[configured.Type] {
+			problems = append(problems, fmt.Errorf("agent %q has unsupported type %q", name, configured.Type))
+		}
+		if configured.Command == "" {
+			problems = append(problems, fmt.Errorf("agent %q command must not be empty", name))
+		}
+		if configured.Enabled != nil && *configured.Enabled {
+			enabled++
+		}
+	}
+	if enabled == 0 {
+		problems = append(problems, errors.New("at least one agent must be enabled"))
+	}
+	defaultConfig, ok := c.Agents[c.DefaultAgent]
+	if !ok || defaultConfig.Enabled == nil || !*defaultConfig.Enabled {
+		problems = append(problems, fmt.Errorf("default_agent %q must name an enabled agent", c.DefaultAgent))
 	}
 	return errors.Join(problems...)
 }
@@ -185,6 +242,16 @@ func (c *Config) IsAllowedUser(id int64) bool {
 		}
 	}
 	return false
+}
+
+func (c *Config) EnabledAgents() map[string]AgentConfig {
+	result := make(map[string]AgentConfig)
+	for name, configured := range c.Agents {
+		if configured.Enabled != nil && *configured.Enabled {
+			result[name] = configured
+		}
+	}
+	return result
 }
 
 func normalizeID(value string) string {

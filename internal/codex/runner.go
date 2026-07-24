@@ -11,34 +11,14 @@ import (
 	"os"
 	"os/exec"
 	"strings"
-	"sync"
-	"syscall"
-	"time"
+
+	"github.com/sovereign313/Agent-Relay/internal/agent"
 )
 
-const maxDiagnosticBytes = 64 * 1024
-
-type Request struct {
-	ProjectPath string
-	ThreadID    string
-	Prompt      string
-	OnThread    func(string) error
-	OnEvent     func(Event)
-}
-
-type Event struct {
-	Type    string
-	Message string
-}
-
-type Result struct {
-	ThreadID     string
-	FinalMessage string
-}
-
-type Runner interface {
-	Run(context.Context, Request) (Result, error)
-}
+type Request = agent.Request
+type Event = agent.Event
+type Result = agent.Result
+type Runner = agent.Runner
 
 type ExecRunner struct {
 	Command    string
@@ -49,39 +29,23 @@ type ExecRunner struct {
 }
 
 func (r *ExecRunner) Validate(ctx context.Context) (string, error) {
-	versionCommand := exec.CommandContext(ctx, r.Command, append(append([]string(nil), r.Args...), "--version")...)
-	versionCommand.Env = r.environment()
-	versionOutput, err := versionCommand.CombinedOutput()
+	version, err := agent.Version(ctx, r.Command, append(append([]string(nil), r.Args...), "--version"), r.RemoveEnv)
 	if err != nil {
 		return "", fmt.Errorf("run codex --version: %w", err)
 	}
-	version := lastNonEmptyLine(string(versionOutput))
 
 	helpArgs := append([]string(nil), r.Args...)
 	helpArgs = append(helpArgs, "exec", "resume", "--help")
-	helpCommand := exec.CommandContext(ctx, r.Command, helpArgs...)
-	helpCommand.Env = r.environment()
-	helpOutput, err := helpCommand.CombinedOutput()
+	help, err := agent.Help(ctx, r.Command, helpArgs, r.RemoveEnv)
 	if err != nil {
 		return "", fmt.Errorf("inspect codex exec resume: %w", err)
 	}
-	help := string(helpOutput)
 	for _, required := range []string{"SESSION_ID", "--json", "--output-last-message", "--dangerously-bypass-approvals-and-sandbox"} {
 		if !strings.Contains(help, required) {
 			return "", fmt.Errorf("codex exec resume does not advertise required capability %s", required)
 		}
 	}
 	return version, nil
-}
-
-func lastNonEmptyLine(output string) string {
-	lines := strings.Split(strings.TrimSpace(output), "\n")
-	for index := len(lines) - 1; index >= 0; index-- {
-		if value := strings.TrimSpace(lines[index]); value != "" {
-			return value
-		}
-	}
-	return "unknown"
 }
 
 func (r *ExecRunner) Archive(ctx context.Context, threadID string) error {
@@ -91,17 +55,20 @@ func (r *ExecRunner) Archive(ctx context.Context, threadID string) error {
 	args := append([]string(nil), r.Args...)
 	args = append(args, "archive", threadID)
 	command := exec.CommandContext(ctx, r.Command, args...)
-	command.Env = r.environment()
-	var stderr limitedBuffer
-	command.Stderr = &stderr
-	if err := command.Run(); err != nil {
-		detail := strings.TrimSpace(stderr.String())
+	command.Env = agent.Environment(r.RemoveEnv)
+	output, err := command.CombinedOutput()
+	if err != nil {
+		detail := strings.TrimSpace(string(output))
 		if detail != "" {
 			return fmt.Errorf("archive Codex thread: %w: %s", err, detail)
 		}
 		return fmt.Errorf("archive Codex thread: %w", err)
 	}
 	return nil
+}
+
+func (r *ExecRunner) Reset(ctx context.Context, threadID string) error {
+	return r.Archive(ctx, threadID)
 }
 
 func (r *ExecRunner) Run(ctx context.Context, request Request) (Result, error) {
@@ -144,78 +111,35 @@ func (r *ExecRunner) Run(ctx context.Context, request Request) (Result, error) {
 	}
 	args = append(args, "-")
 
-	runContext, cancelRun := context.WithCancel(ctx)
-	defer cancelRun()
-	command := exec.CommandContext(runContext, r.Command, args...)
-	command.Dir = request.ProjectPath
-	command.Env = r.environment()
-	command.Stdin = strings.NewReader(request.Prompt)
-	command.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
-	const interruptGrace = 5 * time.Second
-	command.WaitDelay = interruptGrace + 2*time.Second
-	processDone := make(chan struct{})
-	command.Cancel = func() error {
-		if command.Process == nil {
-			return nil
-		}
-		err := syscall.Kill(-command.Process.Pid, syscall.SIGINT)
-		if errors.Is(err, syscall.ESRCH) {
-			return nil
-		}
-		if err == nil {
-			go func(pid int) {
-				timer := time.NewTimer(interruptGrace)
-				defer timer.Stop()
-				select {
-				case <-processDone:
-				case <-timer.C:
-					_ = syscall.Kill(-pid, syscall.SIGKILL)
-				}
-			}(command.Process.Pid)
-		}
-		return err
-	}
-
-	stdout, err := command.StdoutPipe()
-	if err != nil {
-		return Result{}, fmt.Errorf("capture codex output: %w", err)
-	}
-	var stderr limitedBuffer
-	command.Stderr = &stderr
-
-	if err := command.Start(); err != nil {
-		return Result{}, fmt.Errorf("start codex: %w", err)
-	}
-
 	threadID := request.ThreadID
-	parseErr := parseEvents(stdout, func(event wireEvent) error {
-		if event.ThreadID != "" && threadID == "" {
-			threadID = event.ThreadID
-			if request.OnThread != nil {
-				if err := request.OnThread(threadID); err != nil {
-					return fmt.Errorf("persist codex thread: %w", err)
+	stderr, err := agent.RunCommand(ctx, agent.Command{
+		Path:      r.Command,
+		Args:      args,
+		Dir:       request.ProjectPath,
+		Stdin:     strings.NewReader(request.Prompt),
+		RemoveEnv: r.RemoveEnv,
+	}, func(stdout io.Reader) error {
+		return parseEvents(stdout, func(event wireEvent) error {
+			if event.ThreadID != "" && threadID == "" {
+				threadID = event.ThreadID
+				if request.OnThread != nil {
+					if err := request.OnThread(threadID); err != nil {
+						return fmt.Errorf("persist codex thread: %w", err)
+					}
 				}
 			}
-		}
-		if request.OnEvent != nil {
-			request.OnEvent(Event{Type: event.Type, Message: event.Message()})
-		}
-		return nil
+			if request.OnEvent != nil {
+				request.OnEvent(Event{Type: event.Type, Message: event.Message()})
+			}
+			return nil
+		})
 	})
-	if parseErr != nil {
-		cancelRun()
-	}
-	waitErr := command.Wait()
-	close(processDone)
-	if parseErr != nil {
-		return Result{ThreadID: threadID}, parseErr
-	}
-	if waitErr != nil {
-		detail := strings.TrimSpace(stderr.String())
+	if err != nil {
+		detail := strings.TrimSpace(stderr)
 		if detail != "" {
-			return Result{ThreadID: threadID}, fmt.Errorf("codex failed: %w: %s", waitErr, detail)
+			return Result{ThreadID: threadID}, fmt.Errorf("codex failed: %w: %s", err, detail)
 		}
-		return Result{ThreadID: threadID}, fmt.Errorf("codex failed: %w", waitErr)
+		return Result{ThreadID: threadID}, fmt.Errorf("codex failed: %w", err)
 	}
 
 	final, err := os.ReadFile(outputPath)
@@ -233,21 +157,7 @@ func (r *ExecRunner) Run(ctx context.Context, request Request) (Result, error) {
 }
 
 func (r *ExecRunner) environment() []string {
-	if len(r.RemoveEnv) == 0 {
-		return os.Environ()
-	}
-	removed := make(map[string]bool, len(r.RemoveEnv))
-	for _, key := range r.RemoveEnv {
-		removed[key] = true
-	}
-	environment := make([]string, 0, len(os.Environ()))
-	for _, entry := range os.Environ() {
-		key, _, _ := strings.Cut(entry, "=")
-		if !removed[key] {
-			environment = append(environment, entry)
-		}
-	}
-	return environment
+	return agent.Environment(r.RemoveEnv)
 }
 
 type wireEvent struct {
@@ -300,29 +210,4 @@ func parseEvents(reader io.Reader, handle func(wireEvent) error) error {
 		return fmt.Errorf("read Codex JSON events: %w", err)
 	}
 	return nil
-}
-
-type limitedBuffer struct {
-	mu     sync.Mutex
-	buffer bytes.Buffer
-}
-
-func (b *limitedBuffer) Write(data []byte) (int, error) {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	remaining := maxDiagnosticBytes - b.buffer.Len()
-	if remaining > 0 {
-		if len(data) > remaining {
-			_, _ = b.buffer.Write(data[:remaining])
-		} else {
-			_, _ = b.buffer.Write(data)
-		}
-	}
-	return len(data), nil
-}
-
-func (b *limitedBuffer) String() string {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	return b.buffer.String()
 }

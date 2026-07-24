@@ -113,16 +113,18 @@ func shortID(id string) string {
 const helpText = `Agent Relay commands:
 /projects — list discovered Git projects
 /project <id> — select a project
-/sessions — list saved Codex contexts
-/queue — list durable jobs for the selected project
+/agents — list configured coding agents
+/agent <name> — select Codex, Claude, OpenCode, or Grok
+/sessions — list saved agent contexts
+/queue — list durable jobs for the selected project and agent
 /clearqueue — discard queued or interrupted jobs
 /retry <job-id> — explicitly retry an interrupted job
 /new — start a fresh context for the selected project
-/last — resend the last completed Codex response
-/status — show the current project and task state
+/last — resend the last completed agent response
+/status — show the current project, agent, and task state
 /cancel — interrupt the current task
 /cancelall — interrupt every running task for this chat
 /refresh — rescan configured project roots
 /help — show this message
 
-Send any other text to Codex in the selected project.`
+Send any other text to the selected agent in the selected project.`

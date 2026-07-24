@@ -6,7 +6,7 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/sovereign313/Agent-Relay/internal/codex"
+	"github.com/sovereign313/Agent-Relay/internal/agent"
 	"github.com/sovereign313/Agent-Relay/internal/session"
 	"github.com/sovereign313/Agent-Relay/internal/store"
 )
@@ -28,7 +28,15 @@ func (s *Service) acceptJob(updateID, chatID int64, prompt string) error {
 		s.send(chatID, "The selected project is no longer available. Run /projects and select another.")
 		return nil
 	}
-	status := s.sessions.Status(session.Key{ChatID: chatID, ProjectID: selected.ID})
+	agentName := s.selectedAgent(chatID)
+	if _, ok := s.runners[agentName]; !ok {
+		if _, err := s.store.AcceptUpdate(updateID, nil, nil); err != nil {
+			return err
+		}
+		s.send(chatID, "The selected agent is unavailable. Run /agents and select another.")
+		return nil
+	}
+	status := s.sessions.Status(session.Key{ChatID: chatID, ProjectID: selected.ID, AgentName: agentName})
 	if status.Queued >= s.cfg.QueueSize {
 		if _, err := s.store.AcceptUpdate(updateID, nil, nil); err != nil {
 			return err
@@ -38,17 +46,19 @@ func (s *Service) acceptJob(updateID, chatID int64, prompt string) error {
 	}
 
 	now := time.Now().UTC()
-	conversation, exists := s.store.Conversation(chatID, selected.ID)
+	conversation, exists := s.store.Conversation(chatID, selected.ID, agentName)
 	if !exists {
 		conversation = store.Conversation{
 			ChatID:      chatID,
 			ProjectID:   selected.ID,
 			ProjectPath: selected.Path,
+			AgentName:   agentName,
 			CreatedAt:   now,
 		}
 	} else if conversation.ProjectPath != "" && conversation.ProjectPath != selected.Path {
 		s.log.Warn(
-			"project path changed; resetting Codex thread",
+			"project path changed; resetting agent thread",
+			"agent", agentName,
 			"chat_id", chatID,
 			"project", selected.ID,
 			"old_path", conversation.ProjectPath,
@@ -67,6 +77,7 @@ func (s *Service) acceptJob(updateID, chatID int64, prompt string) error {
 		ChatID:      chatID,
 		ProjectID:   selected.ID,
 		ProjectPath: selected.Path,
+		AgentName:   agentName,
 		Prompt:      prompt,
 		CreatedAt:   now,
 	}
@@ -86,12 +97,12 @@ func (s *Service) acceptJob(updateID, chatID int64, prompt string) error {
 		return nil
 	}
 	if err != nil {
-		return fmt.Errorf("queue Codex task: %w", err)
+		return fmt.Errorf("queue agent task: %w", err)
 	}
 	if queued {
 		s.send(chatID, "Queued behind the current task.")
 	} else {
-		s.send(chatID, "Codex is working in "+selected.ID+"...")
+		s.send(chatID, agentName+" is working in "+selected.ID+"...")
 	}
 	return nil
 }
@@ -100,21 +111,26 @@ func (s *Service) process(parent context.Context, job session.Job) {
 	timeoutContext, cancel := context.WithTimeout(parent, s.cfg.TaskDuration())
 	defer cancel()
 
-	conversation, exists := s.store.Conversation(job.Key.ChatID, job.Key.ProjectID)
+	conversation, exists := s.store.Conversation(job.Key.ChatID, job.Key.ProjectID, job.Key.AgentName)
 	if !exists {
-		s.completeWithoutConversation(job, "Codex session state was lost before the task started.")
+		s.completeWithoutConversation(job, "Agent session state was lost before the task started.")
 		return
 	}
 	conversation.State = store.StateWorking
 	conversation.LastActivity = time.Now().UTC()
 	if err := s.store.StartJob(job.ID, conversation); err != nil {
 		s.log.Error("persist working job", "job_id", job.ID, "error_type", fmt.Sprintf("%T", err))
-		s.completeWithoutConversation(job, "Could not persist the Codex session.")
+		s.completeWithoutConversation(job, "Could not persist the agent session.")
 		return
 	}
 
 	var deliveryText string
-	result, err := s.runner.Run(timeoutContext, codex.Request{
+	runner, ok := s.runners[job.Key.AgentName]
+	if !ok {
+		s.completeWithoutConversation(job, "The configured agent is no longer available.")
+		return
+	}
+	result, err := runner.Run(timeoutContext, agent.Request{
 		ProjectPath: job.ProjectPath,
 		ThreadID:    conversation.ThreadID,
 		Prompt:      job.Prompt,
@@ -123,10 +139,10 @@ func (s *Service) process(parent context.Context, job session.Job) {
 			conversation.LastActivity = time.Now().UTC()
 			return s.store.PutConversation(conversation)
 		},
-		OnEvent: func(event codex.Event) {
+		OnEvent: func(event agent.Event) {
 			switch event.Type {
 			case "turn.started", "turn.completed", "turn.failed", "error":
-				s.log.Debug("codex event", "chat_id", job.Key.ChatID, "project", job.Key.ProjectID, "type", event.Type)
+				s.log.Debug("agent event", "agent", job.Key.AgentName, "chat_id", job.Key.ChatID, "project", job.Key.ProjectID, "type", event.Type)
 			}
 		},
 	})
@@ -138,22 +154,23 @@ func (s *Service) process(parent context.Context, job session.Job) {
 		if parent.Err() != nil || errors.Is(err, context.Canceled) {
 			conversation.State = store.StateStopped
 			conversation.LastError = "cancelled"
-			deliveryText = "Codex task cancelled."
+			deliveryText = job.Key.AgentName + " task cancelled."
 		} else if errors.Is(timeoutContext.Err(), context.DeadlineExceeded) {
 			conversation.State = store.StateFailed
 			conversation.LastError = "task timeout"
-			deliveryText = "Codex task exceeded the configured timeout."
+			deliveryText = job.Key.AgentName + " task exceeded the configured timeout."
 		} else {
 			conversation.State = store.StateFailed
 			conversation.LastError = safeError(err)
 			s.log.Error(
-				"codex task failed",
+				"agent task failed",
+				"agent", job.Key.AgentName,
 				"chat_id", job.Key.ChatID,
 				"project", job.Key.ProjectID,
 				"job_id", job.ID,
 				"error_type", fmt.Sprintf("%T", err),
 			)
-			deliveryText = "Codex failed: " + safeError(err)
+			deliveryText = job.Key.AgentName + " failed: " + safeError(err)
 		}
 	} else {
 		conversation.State = store.StateIdle
@@ -185,8 +202,9 @@ func (s *Service) dispatchJob(job store.PendingJob) (bool, error) {
 	}
 	queued, err := s.sessions.Enqueue(session.Job{
 		ID:          job.ID,
-		Key:         session.Key{ChatID: job.ChatID, ProjectID: job.ProjectID},
+		Key:         session.Key{ChatID: job.ChatID, ProjectID: job.ProjectID, AgentName: job.AgentName},
 		ProjectPath: job.ProjectPath,
+		AgentName:   job.AgentName,
 		Prompt:      job.Prompt,
 	})
 	if err != nil {
@@ -226,6 +244,7 @@ func (s *Service) completeWithoutConversation(job session.Job, text string) {
 		ChatID:       job.Key.ChatID,
 		ProjectID:    job.Key.ProjectID,
 		ProjectPath:  job.ProjectPath,
+		AgentName:    job.Key.AgentName,
 		State:        store.StateFailed,
 		CreatedAt:    now,
 		LastActivity: now,
@@ -239,9 +258,9 @@ func (s *Service) completeWithoutConversation(job session.Job, text string) {
 	s.wakeOutbox()
 }
 
-func (s *Service) hasPersistedJobs(chatID int64, projectID string) bool {
+func (s *Service) hasPersistedJobs(chatID int64, projectID, agentName string) bool {
 	for _, job := range s.store.Jobs() {
-		if job.ChatID == chatID && job.ProjectID == projectID {
+		if job.ChatID == chatID && job.ProjectID == projectID && job.AgentName == agentName {
 			return true
 		}
 	}
