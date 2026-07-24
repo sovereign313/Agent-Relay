@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
@@ -689,25 +690,15 @@ func (s *Service) sendLast(address transport.Address) {
 	s.send(address, conversation.LastResponse)
 }
 
-func (s *Service) projectsMessage(address transport.Address, listing project.Directory) string {
-	selected := s.store.SelectedProject(address)
+func projectsMessage(listing project.Directory) string {
 	location := listing.RelativePath
 	if location == "" || location == "." {
 		location = "/"
 	}
-	lines := []string{"Directories in " + location + ":"}
 	if len(listing.Entries) == 0 {
-		lines = append(lines, "  No subdirectories.")
+		return "Directory: " + location + " (empty)"
 	}
-	for _, item := range listing.Entries {
-		marker := "  "
-		if item.ID == selected {
-			marker = "* "
-		}
-		lines = append(lines, marker+item.Name+"/")
-	}
-	lines = append(lines, "", "Browse: /projects <relative-path>", "Select: /project <relative-path>")
-	return strings.Join(lines, "\n")
+	return "Directory: " + location
 }
 
 func (s *Service) sendProjects(address transport.Address, path string) {
@@ -716,7 +707,39 @@ func (s *Service) sendProjects(address transport.Address, path string) {
 		s.send(address, "Cannot browse that directory. Use a relative path beneath the configured project root.")
 		return
 	}
-	s.send(address, s.projectsMessage(address, listing))
+	s.sendKeyboard(address, projectsMessage(listing), directoryButtons(listing, address.Transport))
+}
+
+func directoryButtons(listing project.Directory, transportName string) [][]transport.Button {
+	limit := 96
+	if transportName == transport.Discord {
+		limit = 10
+	}
+	buttons := make([]transport.Button, 0, min(len(listing.Entries)+1, limit))
+	if listing.RelativePath != "" && listing.RelativePath != "." {
+		parent := filepath.ToSlash(filepath.Dir(filepath.FromSlash(listing.RelativePath)))
+		if parent == "." {
+			parent = ""
+		}
+		buttons = append(buttons, transport.Button{Text: "..", Data: "browse:" + parent})
+	}
+	for _, item := range listing.Entries {
+		if len(buttons) == limit {
+			break
+		}
+		data := "browse:" + item.ID
+		if len(data) > 64 {
+			continue
+		}
+		buttons = append(buttons, transport.Button{Text: item.Name + "/", Data: data})
+	}
+	rows := make([][]transport.Button, 0, (len(buttons)+1)/2)
+	for len(buttons) > 0 {
+		take := min(2, len(buttons))
+		rows = append(rows, append([]transport.Button(nil), buttons[:take]...))
+		buttons = buttons[take:]
+	}
+	return rows
 }
 
 func (s *Service) agentsMessage(address transport.Address) string {

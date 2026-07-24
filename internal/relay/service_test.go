@@ -310,16 +310,29 @@ state_file = "./state.json"
 	)
 	defer service.sessions.Close()
 
-	if err := service.handleUpdate(ctx, textUpdate(1, "/projects group")); err != nil {
+	if err := service.handleUpdate(ctx, textUpdate(1, "/projects")); err != nil {
 		t.Fatal(err)
 	}
 	messages := fakeTelegram.Messages()
-	if len(messages) != 1 || !strings.Contains(messages[0], "Directories in Group:") ||
-		!strings.Contains(messages[0], "Work Space/") || strings.Contains(messages[0], "Nested/") {
+	if len(messages) != 1 || messages[0] != "Directory: /" {
 		t.Fatalf("browse response = %#v", messages)
 	}
-	if calls := fakeTelegram.KeyboardCalls(); calls != 0 {
-		t.Fatalf("keyboard calls = %d, want 0", calls)
+	if calls := fakeTelegram.KeyboardCalls(); calls != 1 {
+		t.Fatalf("keyboard calls = %d, want 1", calls)
+	}
+	keyboard := fakeTelegram.LastKeyboard()
+	if len(keyboard) != 1 || len(keyboard[0]) != 1 || keyboard[0][0].Data != "browse:Group" {
+		t.Fatalf("root keyboard = %#v", keyboard)
+	}
+	service.handleAction(testAddress, &transport.Action{ID: "browse-group", Data: "browse:Group"})
+	messages = fakeTelegram.Messages()
+	if len(messages) != 2 || messages[1] != "Directory: Group" {
+		t.Fatalf("nested browse response = %#v", messages)
+	}
+	keyboard = fakeTelegram.LastKeyboard()
+	if len(keyboard) != 1 || len(keyboard[0]) != 2 ||
+		keyboard[0][0].Data != "browse:" || keyboard[0][1].Data != "browse:Group/Work Space" {
+		t.Fatalf("nested keyboard = %#v", keyboard)
 	}
 	if err := service.handleUpdate(ctx, textUpdate(2, "/project group/work space")); err != nil {
 		t.Fatal(err)
@@ -333,6 +346,7 @@ type recordingTelegram struct {
 	mu            sync.Mutex
 	messages      []string
 	keyboardCalls int
+	lastKeyboard  [][]transport.Button
 }
 
 type recordingSender struct {
@@ -423,11 +437,12 @@ func (t *recordingTelegram) Send(_ context.Context, _ string, message string) er
 	return nil
 }
 
-func (t *recordingTelegram) SendKeyboard(_ context.Context, _ string, message string, _ [][]transport.Button) error {
+func (t *recordingTelegram) SendKeyboard(_ context.Context, _ string, message string, rows [][]transport.Button) error {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	t.keyboardCalls++
 	t.messages = append(t.messages, message)
+	t.lastKeyboard = append([][]transport.Button(nil), rows...)
 	return nil
 }
 
@@ -445,6 +460,12 @@ func (t *recordingTelegram) KeyboardCalls() int {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	return t.keyboardCalls
+}
+
+func (t *recordingTelegram) LastKeyboard() [][]transport.Button {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return append([][]transport.Button(nil), t.lastKeyboard...)
 }
 
 type recordingRunner struct {
