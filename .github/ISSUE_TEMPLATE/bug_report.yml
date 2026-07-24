@@ -5,7 +5,7 @@ labels: ["bug"]
 body:
   - type: markdown
     attributes:
-      value: Do not include Telegram bot tokens, Codex credentials, private prompts, or repository secrets.
+      value: Do not include bot tokens, agent credentials, private prompts, or repository secrets.
 
   - type: textarea
     id: description

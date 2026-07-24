@@ -2,6 +2,7 @@ package relay
 
 import (
 	"context"
+	"errors"
 	"io"
 	"log/slog"
 	"os"
@@ -233,9 +234,21 @@ state_file = "./state.json"
 	address := transport.Address{Transport: transport.Discord, ConversationID: "dm-123"}
 
 	if err := service.handleInbound(ctx, transport.Inbound{
-		EventID: "discord:1", Sequence: -1, Address: address, Text: "/project alpha",
+		EventID: "discord:autocomplete", Address: address,
+		Autocomplete: &transport.Autocomplete{ID: "autocomplete", Command: "project", Option: "project", Query: "alp"},
 	}); err != nil {
 		t.Fatal(err)
+	}
+	if choices := discordSender.Choices(); len(choices) != 1 || choices[0].Value != "alpha" {
+		t.Fatalf("project autocomplete choices = %#v", choices)
+	}
+	if err := service.handleInbound(ctx, transport.Inbound{
+		EventID: "discord:1", ResponseID: "interaction-1", Sequence: -1, Address: address, Text: "/project alpha",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if responses := discordSender.ResponseIDs(); len(responses) != 1 || responses[0] != "interaction-1" {
+		t.Fatalf("Discord response IDs = %#v", responses)
 	}
 	task := transport.Inbound{EventID: "discord:2", Sequence: -2, Address: address, Text: "change it"}
 	if err := service.handleInbound(ctx, task); err != nil {
@@ -254,6 +267,10 @@ state_file = "./state.json"
 	if outbox := stateStore.Outbox(); len(outbox) != 0 {
 		t.Fatalf("delivered Discord outbox still contains %#v", outbox)
 	}
+	edits := discordSender.StatusEdits()
+	if len(edits) < 2 || edits[len(edits)-1].text != "done" || len(edits[len(edits)-1].buttons) != 0 {
+		t.Fatalf("Discord status edits = %#v", edits)
+	}
 }
 
 type recordingTelegram struct {
@@ -263,8 +280,16 @@ type recordingTelegram struct {
 
 type recordingSender struct {
 	recordingTelegram
-	name      string
-	maxLength int
+	name        string
+	maxLength   int
+	statusEdits []statusEdit
+	choices     []transport.Choice
+	responseIDs []string
+}
+
+type statusEdit struct {
+	text    string
+	buttons [][]transport.Button
 }
 
 func (s *recordingSender) Name() string {
@@ -273,6 +298,53 @@ func (s *recordingSender) Name() string {
 
 func (s *recordingSender) MaxMessageLength() int {
 	return s.maxLength
+}
+
+func (s *recordingSender) CreateStatus(_ context.Context, _ string, message string, buttons [][]transport.Button) (string, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.statusEdits = append(s.statusEdits, statusEdit{text: message, buttons: buttons})
+	return "status-1", nil
+}
+
+func (s *recordingSender) EditStatus(_ context.Context, _, _ string, message string, buttons [][]transport.Button) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.statusEdits = append(s.statusEdits, statusEdit{text: message, buttons: buttons})
+	return nil
+}
+
+func (s *recordingSender) AnswerAutocomplete(_ context.Context, _ string, choices []transport.Choice) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.choices = append([]transport.Choice(nil), choices...)
+	return nil
+}
+
+func (s *recordingSender) SendResponse(_ context.Context, responseID, message string, _ [][]transport.Button) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.responseIDs = append(s.responseIDs, responseID)
+	s.messages = append(s.messages, message)
+	return nil
+}
+
+func (s *recordingSender) StatusEdits() []statusEdit {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return append([]statusEdit(nil), s.statusEdits...)
+}
+
+func (s *recordingSender) Choices() []transport.Choice {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return append([]transport.Choice(nil), s.choices...)
+}
+
+func (s *recordingSender) ResponseIDs() []string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return append([]string(nil), s.responseIDs...)
 }
 
 func (t *recordingTelegram) GetUpdates(context.Context, int64) ([]telegram.Update, error) {
@@ -417,3 +489,94 @@ func TestMakeOutboxMessagesPersistsChunksIndependently(t *testing.T) {
 		}
 	}
 }
+
+func TestJobReferenceRoundTrip(t *testing.T) {
+	for _, id := range []int64{42, -1420000000000000000} {
+		reference := jobReference(id)
+		got, err := parseJobReference(reference)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got != id {
+			t.Fatalf("parseJobReference(%q) = %d, want %d", reference, got, id)
+		}
+	}
+}
+
+func TestDeliverOutboxFallsBackWhenStatusEditFails(t *testing.T) {
+	stateStore, err := store.Open(filepath.Join(t.TempDir(), "state.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := stateStore.PutOutbox(store.OutboxMessage{
+		ID: "job:1:0", Transport: transport.Discord, ConversationID: "dm",
+		Text: "final", EditMessageID: "missing-status", CreatedAt: time.Now().UTC(),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	sender := &failingStatusSender{}
+	service := &Service{
+		log: slog.New(slog.NewTextHandler(io.Discard, nil)), store: stateStore,
+		senders: map[string]transport.Sender{transport.Discord: sender},
+	}
+	service.deliverOutbox(context.Background())
+	if outbox := stateStore.Outbox(); len(outbox) != 0 {
+		t.Fatalf("outbox after fallback delivery = %#v", outbox)
+	}
+	sender.mu.Lock()
+	defer sender.mu.Unlock()
+	if len(sender.messages) != 1 || sender.messages[0] != "final" {
+		t.Fatalf("fallback messages = %#v", sender.messages)
+	}
+}
+
+func TestRunReturnsWhenConfiguredTransportStops(t *testing.T) {
+	stateStore, err := store.Open(filepath.Join(t.TempDir(), "state.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	service := New(
+		ctx,
+		&config.Config{QueueSize: 1},
+		slog.New(slog.NewTextHandler(io.Discard, nil)),
+		nil,
+		stateStore,
+		nil,
+		map[string]agent.Runner{},
+		"test",
+		map[string]string{},
+		&failingSource{err: errors.New("gateway stopped")},
+	)
+	err = service.Run(ctx)
+	if err == nil || !strings.Contains(err.Error(), "gateway stopped") {
+		t.Fatalf("Run error = %v", err)
+	}
+}
+
+type failingStatusSender struct {
+	recordingTelegram
+}
+
+func (s *failingStatusSender) Name() string          { return transport.Discord }
+func (s *failingStatusSender) MaxMessageLength() int { return 2000 }
+func (s *failingStatusSender) CreateStatus(context.Context, string, string, [][]transport.Button) (string, error) {
+	return "", errors.New("not used")
+}
+func (s *failingStatusSender) EditStatus(context.Context, string, string, string, [][]transport.Button) error {
+	return errors.New("message was deleted")
+}
+
+type failingSource struct {
+	err error
+}
+
+func (s *failingSource) Name() string                               { return transport.Discord }
+func (s *failingSource) MaxMessageLength() int                      { return 2000 }
+func (s *failingSource) Send(context.Context, string, string) error { return nil }
+func (s *failingSource) SendKeyboard(context.Context, string, string, [][]transport.Button) error {
+	return nil
+}
+func (s *failingSource) AnswerAction(context.Context, string, string) error { return nil }
+func (s *failingSource) Run(context.Context, transport.Sink) error          { return s.err }

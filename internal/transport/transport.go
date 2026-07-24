@@ -29,13 +29,15 @@ func (a Address) String() string {
 }
 
 type Inbound struct {
-	EventID  string
-	Sequence int64
-	Address  Address
-	UserID   string
-	Private  bool
-	Text     string
-	Action   *Action
+	EventID      string
+	ResponseID   string
+	Sequence     int64
+	Address      Address
+	UserID       string
+	Private      bool
+	Text         string
+	Action       *Action
+	Autocomplete *Autocomplete
 }
 
 type Action struct {
@@ -46,6 +48,23 @@ type Action struct {
 type Button struct {
 	Text string
 	Data string
+}
+
+type Autocomplete struct {
+	ID      string
+	Command string
+	Option  string
+	Query   string
+}
+
+type Choice struct {
+	Name  string
+	Value string
+}
+
+type Health struct {
+	State  string
+	Detail string
 }
 
 type Sink func(context.Context, Inbound) error
@@ -61,6 +80,27 @@ type Sender interface {
 type Source interface {
 	Sender
 	Run(context.Context, Sink) error
+}
+
+type StatusEditor interface {
+	CreateStatus(context.Context, string, string, [][]Button) (string, error)
+	EditStatus(context.Context, string, string, string, [][]Button) error
+}
+
+type ResponseSender interface {
+	SendResponse(context.Context, string, string, [][]Button) error
+}
+
+type AutocompleteResponder interface {
+	AnswerAutocomplete(context.Context, string, []Choice) error
+}
+
+type HealthReporter interface {
+	Health() Health
+}
+
+type Prober interface {
+	Probe(context.Context) error
 }
 
 var ErrUnsupported = errors.New("transport operation is unsupported")

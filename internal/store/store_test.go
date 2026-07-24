@@ -1,6 +1,7 @@
 package store
 
 import (
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"testing"
@@ -75,14 +76,15 @@ func TestStoreReconcilesWorkingJobWithoutReplayingIt(t *testing.T) {
 		LastActivity:   now,
 	}
 	job := PendingJob{
-		ID:             100,
-		Transport:      transport.Telegram,
-		ConversationID: "42",
-		ProjectID:      "alpha",
-		ProjectPath:    "/projects/alpha",
-		AgentName:      "codex",
-		Prompt:         "change something",
-		CreatedAt:      now,
+		ID:              100,
+		Transport:       transport.Telegram,
+		ConversationID:  "42",
+		ProjectID:       "alpha",
+		ProjectPath:     "/projects/alpha",
+		AgentName:       "codex",
+		Prompt:          "change something",
+		StatusMessageID: "status-100",
+		CreatedAt:       now,
 	}
 	if accepted, err := stateStore.AcceptUpdate(100, &job, &conversation); err != nil || !accepted {
 		t.Fatalf("AcceptUpdate = %v, %v", accepted, err)
@@ -103,9 +105,45 @@ func TestStoreReconcilesWorkingJobWithoutReplayingIt(t *testing.T) {
 	if len(interrupted) != 1 || interrupted[0].State != JobInterrupted {
 		t.Fatalf("interrupted jobs = %#v", interrupted)
 	}
+	if interrupted[0].StatusMessageID != "status-100" {
+		t.Fatalf("status message ID = %q", interrupted[0].StatusMessageID)
+	}
 	got, _ := reopened.Conversation(telegramAddress, "alpha", "codex")
 	if got.State != StateStopped {
 		t.Fatalf("conversation state = %q, want stopped", got.State)
+	}
+}
+
+func TestOpenMigratesVersionFourState(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "state.json")
+	data, err := json.Marshal(map[string]any{
+		"version":           4,
+		"selected_projects": map[string]string{},
+		"selected_agents":   map[string]string{},
+		"conversations":     map[string]any{},
+		"jobs":              map[string]any{},
+		"outbox":            map[string]any{},
+		"processed_events":  map[string]any{},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, data, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Open(path); err != nil {
+		t.Fatal(err)
+	}
+	persisted, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var state map[string]any
+	if err := json.Unmarshal(persisted, &state); err != nil {
+		t.Fatal(err)
+	}
+	if state["version"] != float64(5) {
+		t.Fatalf("version = %#v, want 5", state["version"])
 	}
 }
 

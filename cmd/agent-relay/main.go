@@ -6,8 +6,10 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"log/slog"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"sort"
 	"strings"
 	"syscall"
@@ -79,6 +81,12 @@ func run(args []string, stdout, stderr io.Writer) error {
 			fmt.Fprintf(stdout, "%-24s %s\n", item.ID, item.Path)
 		}
 		return nil
+	case "doctor":
+		configPath, err := parseConfigFlag("doctor", args[1:], stderr)
+		if err != nil {
+			return err
+		}
+		return runDoctor(configPath, stdout)
 	case "version", "--version", "-version":
 		fmt.Fprintln(stdout, version)
 		return nil
@@ -129,6 +137,28 @@ func runDaemon(configPath string) error {
 
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
+	telegramTransport, sources, err := newTransports(cfg, logger)
+	if err != nil {
+		return err
+	}
+	service := relay.New(ctx, cfg, logger, telegramTransport, stateStore, catalog, runners, version, agentVersions, sources...)
+	logger.Info(
+		"agent relay starting",
+		"version", version,
+		"projects", len(catalog.List()),
+		"agents", formatAgentVersions(agentVersions),
+	)
+	for name, configured := range cfg.EnabledAgents() {
+		if *configured.FullAccess {
+			logger.Warn("agent Full Access is enabled; it can access everything available to its OS user", "agent", name)
+		}
+	}
+	err = service.Run(ctx)
+	logger.Info("agent relay stopped")
+	return err
+}
+
+func newTransports(cfg *config.Config, logger *slog.Logger) (relay.Telegram, []transport.Source, error) {
 	var telegramTransport relay.Telegram
 	if cfg.TelegramToken != "" && cfg.TelegramToken != "BOT_TOKEN" {
 		client := telegram.New(cfg.TelegramToken, cfg.TelegramAPIBase, nil)
@@ -146,25 +176,113 @@ func runDaemon(configPath string) error {
 			PrivateChannelsOnly: *cfg.Discord.PrivateChannelsOnly,
 		}, logger)
 		if err != nil {
-			return err
+			return nil, nil, err
 		}
 		sources = append(sources, gateway)
 	}
-	service := relay.New(ctx, cfg, logger, telegramTransport, stateStore, catalog, runners, version, agentVersions, sources...)
-	logger.Info(
-		"agent relay starting",
-		"version", version,
-		"projects", len(catalog.List()),
-		"agents", formatAgentVersions(agentVersions),
-	)
-	for name, configured := range cfg.EnabledAgents() {
-		if *configured.FullAccess {
-			logger.Warn("agent Full Access is enabled; it can access everything available to its OS user", "agent", name)
+	return telegramTransport, sources, nil
+}
+
+func runDoctor(configPath string, output io.Writer) error {
+	cfg, catalog, err := loadRuntime(configPath)
+	if err != nil {
+		return err
+	}
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	telegramTransport, sources, err := newTransports(cfg, logger)
+	if err != nil {
+		return err
+	}
+	var problems []error
+	fmt.Fprintf(output, "Projects: %d discovered\n", len(catalog.List()))
+	for _, root := range cfg.ProjectRoots {
+		resolved := cfg.ResolvePath(root)
+		if err := checkWritableDirectory(resolved); err != nil {
+			fmt.Fprintf(output, "FAIL project root %s: %v\n", resolved, err)
+			problems = append(problems, err)
+		} else {
+			fmt.Fprintf(output, "OK   project root %s\n", resolved)
 		}
 	}
-	err = service.Run(ctx)
-	logger.Info("agent relay stopped")
-	return err
+	for _, path := range []string{filepath.Dir(cfg.ResolvePath(cfg.StateFile)), filepath.Dir(resolveOptionalPath(cfg, cfg.LogFile))} {
+		if path == "." || path == "" {
+			continue
+		}
+		if err := checkWritableDirectory(path); err != nil {
+			fmt.Fprintf(output, "FAIL writable directory %s: %v\n", path, err)
+			problems = append(problems, err)
+		} else {
+			fmt.Fprintf(output, "OK   writable directory %s\n", path)
+		}
+	}
+	statePath := cfg.ResolvePath(cfg.StateFile)
+	if _, err := store.Open(statePath); err != nil {
+		fmt.Fprintf(output, "FAIL state file %s: %v\n", statePath, err)
+		problems = append(problems, err)
+	} else {
+		fmt.Fprintf(output, "OK   state file %s\n", statePath)
+	}
+	var senders []transport.Sender
+	if telegramTransport != nil {
+		senders = append(senders, telegramTransport)
+	}
+	for _, source := range sources {
+		senders = append(senders, source)
+	}
+	for _, sender := range senders {
+		prober, ok := sender.(transport.Prober)
+		if !ok {
+			continue
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+		err := prober.Probe(ctx)
+		cancel()
+		if err != nil {
+			fmt.Fprintf(output, "FAIL %s transport: %v\n", sender.Name(), err)
+			problems = append(problems, err)
+		} else {
+			fmt.Fprintf(output, "OK   %s transport credentials and connectivity\n", sender.Name())
+		}
+	}
+	runners := newRunners(cfg)
+	names := make([]string, 0, len(runners))
+	for name := range runners {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	for _, name := range names {
+		runner := runners[name]
+		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+		agentVersion, err := runner.Validate(ctx)
+		cancel()
+		if err != nil {
+			fmt.Fprintf(output, "FAIL agent %s: %v\n", name, err)
+			problems = append(problems, err)
+		} else {
+			fmt.Fprintf(output, "OK   agent %s: %s\n", name, agentVersion)
+		}
+	}
+	if len(problems) > 0 {
+		return fmt.Errorf("doctor found %d problem(s)", len(problems))
+	}
+	fmt.Fprintln(output, "Doctor: all checks passed")
+	return nil
+}
+
+func checkWritableDirectory(path string) error {
+	if err := os.MkdirAll(path, 0o700); err != nil {
+		return err
+	}
+	file, err := os.CreateTemp(path, ".agent-relay-doctor-*")
+	if err != nil {
+		return err
+	}
+	name := file.Name()
+	if err := file.Close(); err != nil {
+		os.Remove(name)
+		return err
+	}
+	return os.Remove(name)
 }
 
 func newRunners(cfg *config.Config) map[string]agent.Runner {
@@ -256,6 +374,7 @@ func printUsage(writer io.Writer) {
 	fmt.Fprintln(writer, `Usage:
   agent-relay run --config ./config.toml
   agent-relay validate --config ./config.toml
+  agent-relay doctor --config ./config.toml
   agent-relay projects --config ./config.toml
   agent-relay version`)
 }

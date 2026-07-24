@@ -5,6 +5,7 @@ import (
 	"errors"
 	"io"
 	"net/http"
+	"net/url"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -84,6 +85,55 @@ func TestSendRetriesTransientTelegramFailures(t *testing.T) {
 	if got := attempts.Load(); got != 3 {
 		t.Fatalf("attempts = %d, want 3", got)
 	}
+}
+
+func TestCreateAndEditStatus(t *testing.T) {
+	var requests []*http.Request
+	client := New("token", "https://example.invalid", &http.Client{Transport: roundTripFunc(func(request *http.Request) (*http.Response, error) {
+		requests = append(requests, request)
+		body := `{"ok":true,"result":{}}`
+		if strings.HasSuffix(request.URL.Path, "/sendMessage") {
+			body = `{"ok":true,"result":{"message_id":77}}`
+		}
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Body:       io.NopCloser(strings.NewReader(body)),
+		}, nil
+	})})
+	rows := [][]Button{{{Text: "Cancel", Data: "canceljob:1"}}}
+	messageID, err := client.CreateStatus(context.Background(), 42, "working", rows)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if messageID != 77 {
+		t.Fatalf("message ID = %d, want 77", messageID)
+	}
+	if err := client.EditStatus(context.Background(), 42, messageID, "done", nil); err != nil {
+		t.Fatal(err)
+	}
+	if len(requests) != 2 {
+		t.Fatalf("requests = %d, want 2", len(requests))
+	}
+	editValues := parseRequestForm(t, requests[1])
+	if !strings.HasSuffix(requests[1].URL.Path, "/editMessageText") || editValues.Get("message_id") != "77" {
+		t.Fatalf("edit request = %s %#v", requests[1].URL.Path, editValues)
+	}
+	if editValues.Get("reply_markup") != `{"inline_keyboard":[]}` {
+		t.Fatalf("edit reply markup = %q", editValues.Get("reply_markup"))
+	}
+}
+
+func parseRequestForm(t *testing.T, request *http.Request) url.Values {
+	t.Helper()
+	data, err := io.ReadAll(request.Body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	values, err := url.ParseQuery(string(data))
+	if err != nil {
+		t.Fatal(err)
+	}
+	return values
 }
 
 type roundTripFunc func(*http.Request) (*http.Response, error)

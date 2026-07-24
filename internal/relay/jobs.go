@@ -94,21 +94,27 @@ func (s *Service) acceptJob(inbound transport.Inbound) error {
 	if !accepted {
 		return nil
 	}
-	queued, err := s.dispatchJob(job)
+	queuePosition := 0
+	if status.Working || status.Queued > 0 {
+		queuePosition = status.Queued + 1
+	}
+	if queuePosition > 0 {
+		s.createJobStatus(job, fmt.Sprintf("Queued #%d for %s in %s.\nJob: %s", queuePosition, agentName, selected.ID, jobReference(job.ID)), clearQueueButtons())
+	} else {
+		s.createJobStatus(job, fmt.Sprintf("Starting %s in %s...\nJob: %s", agentName, selected.ID, jobReference(job.ID)), cancelButtons(job.ID))
+	}
+	_, err = s.dispatchJob(job)
 	if errors.Is(err, session.ErrQueueFull) {
 		if stateErr := s.store.SetJobState(job.ID, store.JobPending); stateErr != nil {
 			return stateErr
 		}
-		s.send(address, "The task was saved and will run when queue space is available.")
+		if persisted, ok := s.store.Job(job.ID); ok {
+			s.editJobStatus(persisted, "The task was saved and will run when queue space is available.\nJob: "+jobReference(job.ID), clearQueueButtons())
+		}
 		return nil
 	}
 	if err != nil {
 		return fmt.Errorf("queue agent task: %w", err)
-	}
-	if queued {
-		s.send(address, "Queued behind the current task.")
-	} else {
-		s.send(address, agentName+" is working in "+selected.ID+"...")
 	}
 	return nil
 }
@@ -128,6 +134,9 @@ func (s *Service) process(parent context.Context, job session.Job) {
 		s.log.Error("persist working job", "job_id", job.ID, "error_type", fmt.Sprintf("%T", err))
 		s.completeWithoutConversation(job, "Could not persist the agent session.")
 		return
+	}
+	if persisted, ok := s.store.Job(job.ID); ok {
+		s.editJobStatus(persisted, fmt.Sprintf("%s is working in %s...\nJob: %s", job.Key.AgentName, job.Key.ProjectID, jobReference(job.ID)), cancelButtons(job.ID))
 	}
 
 	var deliveryText string
@@ -184,7 +193,13 @@ func (s *Service) process(parent context.Context, job session.Job) {
 		conversation.LastResponse = result.FinalMessage
 		deliveryText = result.FinalMessage
 	}
-	messages := s.makeOutboxMessages(fmt.Sprintf("job:%d", job.ID), job.Key.Address, deliveryText)
+	persistedJob, _ := s.store.Job(job.ID)
+	messages := s.makeOutboxMessages(
+		fmt.Sprintf("job:%d", job.ID),
+		job.Key.Address,
+		deliveryText,
+		deliveryEdit{MessageID: persistedJob.StatusMessageID},
+	)
 	if persistErr := s.store.CompleteJob(job.ID, conversation, messages); persistErr != nil {
 		s.log.Error("persist completed conversation", "job_id", job.ID, "error_type", fmt.Sprintf("%T", persistErr))
 	}
@@ -257,7 +272,13 @@ func (s *Service) completeWithoutConversation(job session.Job, text string) {
 		LastActivity:   now,
 		LastError:      text,
 	}
-	messages := s.makeOutboxMessages(fmt.Sprintf("job:%d", job.ID), job.Key.Address, text)
+	persistedJob, _ := s.store.Job(job.ID)
+	messages := s.makeOutboxMessages(
+		fmt.Sprintf("job:%d", job.ID),
+		job.Key.Address,
+		text,
+		deliveryEdit{MessageID: persistedJob.StatusMessageID},
+	)
 	if err := s.store.CompleteJob(job.ID, conversation, messages); err != nil {
 		s.log.Error("complete failed job", "job_id", job.ID, "error_type", fmt.Sprintf("%T", err))
 	}

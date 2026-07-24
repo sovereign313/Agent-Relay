@@ -11,14 +11,15 @@ Report suspected vulnerabilities through
 Do not include secrets in a public issue.
 
 Include the affected commit or version, impact, reproduction steps, and any
-suggested mitigation. Sanitize Telegram tokens, agent credentials, prompts,
+suggested mitigation. Sanitize bot tokens, agent credentials, prompts,
 logs, paths, and private repository content.
 
 ## Deployment Expectations
 
-- Use a dedicated Telegram bot and a strict numeric user allowlist.
-- Keep `private_chats_only = true`.
-- Prefer `telegram_token_env` over storing the bot token in TOML.
+- Use dedicated bot applications and strict per-transport user allowlists.
+- Keep `private_chats_only = true` and
+  `discord.private_channels_only = true`.
+- Prefer token environment variables over storing bot tokens in TOML.
 - Run under a dedicated OS user with access only to intended project roots.
 - Treat `full_access = true` as unrestricted command execution by that OS user.
 - Keep configuration, state, logs, and agent session data private.

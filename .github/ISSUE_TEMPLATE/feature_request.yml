@@ -15,7 +15,7 @@ body:
     id: proposal
     attributes:
       label: Proposed behavior
-      description: Describe the user-visible behavior and Telegram interaction.
+      description: Describe the user-visible behavior and transport interaction.
     validations:
       required: true
 

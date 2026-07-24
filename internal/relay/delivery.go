@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strconv"
 	"strings"
 	"time"
 
@@ -20,9 +21,48 @@ func (s *Service) send(address transport.Address, message string) {
 		s.log.Error("send message", "address", address, "error", "transport unavailable")
 		return
 	}
+	if responseID := s.takeResponse(address); responseID != "" {
+		if responder, ok := sender.(transport.ResponseSender); ok {
+			if err := responder.SendResponse(ctx, responseID, message, nil); err == nil {
+				return
+			} else {
+				s.log.Warn("send interaction response failed; sending separately", "address", address, "error_type", fmt.Sprintf("%T", err))
+			}
+		}
+	}
 	if err := sender.Send(ctx, address.ConversationID, message); err != nil {
 		s.log.Error("send message", "address", address, "error_type", fmt.Sprintf("%T", err))
 	}
+}
+
+func (s *Service) sendKeyboard(address transport.Address, message string, rows [][]transport.Button) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	sender := s.sender(address)
+	if sender == nil {
+		s.log.Error("send keyboard", "address", address, "error", "transport unavailable")
+		return
+	}
+	if responseID := s.takeResponse(address); responseID != "" {
+		if responder, ok := sender.(transport.ResponseSender); ok {
+			if err := responder.SendResponse(ctx, responseID, message, rows); err == nil {
+				return
+			} else {
+				s.log.Warn("send interaction keyboard failed; sending separately", "address", address, "error_type", fmt.Sprintf("%T", err))
+			}
+		}
+	}
+	if err := sender.SendKeyboard(ctx, address.ConversationID, message, rows); err != nil {
+		s.log.Error("send keyboard", "address", address, "error_type", fmt.Sprintf("%T", err))
+	}
+}
+
+func (s *Service) takeResponse(address transport.Address) string {
+	s.replyMu.Lock()
+	defer s.replyMu.Unlock()
+	responseID := s.replies[address]
+	delete(s.replies, address)
+	return responseID
 }
 
 func (s *Service) answerAction(transportName, actionID, message string) {
@@ -64,7 +104,20 @@ func (s *Service) deliverOutbox(ctx context.Context) {
 			continue
 		}
 		sendContext, cancel := context.WithTimeout(ctx, 2*time.Minute)
-		err := sender.Send(sendContext, message.ConversationID, message.Text)
+		var err error
+		if message.EditMessageID != "" {
+			if editor, ok := sender.(transport.StatusEditor); ok {
+				err = editor.EditStatus(sendContext, message.ConversationID, message.EditMessageID, message.Text, message.Buttons)
+				if err != nil {
+					s.log.Warn("edit persisted status failed; sending response separately", "outbox_id", message.ID, "error_type", fmt.Sprintf("%T", err))
+					err = sender.Send(sendContext, message.ConversationID, message.Text)
+				}
+			} else {
+				err = sender.Send(sendContext, message.ConversationID, message.Text)
+			}
+		} else {
+			err = sender.Send(sendContext, message.ConversationID, message.Text)
+		}
 		cancel()
 		if err != nil {
 			_ = s.store.IncrementOutboxAttempts(message.ID)
@@ -97,7 +150,12 @@ func formatUptime(duration time.Duration) string {
 	return fmt.Sprintf("%dm", minutes)
 }
 
-func (s *Service) makeOutboxMessages(idPrefix string, address transport.Address, message string) []store.OutboxMessage {
+type deliveryEdit struct {
+	MessageID string
+	Buttons   [][]transport.Button
+}
+
+func (s *Service) makeOutboxMessages(idPrefix string, address transport.Address, message string, edits ...deliveryEdit) []store.OutboxMessage {
 	limit := telegram.MaxMessageLength
 	if sender := s.sender(address); sender != nil {
 		limit = sender.MaxMessageLength()
@@ -106,15 +164,68 @@ func (s *Service) makeOutboxMessages(idPrefix string, address transport.Address,
 	now := time.Now().UTC()
 	messages := make([]store.OutboxMessage, 0, len(parts))
 	for index, part := range parts {
-		messages = append(messages, store.OutboxMessage{
+		outbox := store.OutboxMessage{
 			ID:             fmt.Sprintf("%s:%d", idPrefix, index),
 			Transport:      address.Transport,
 			ConversationID: address.ConversationID,
 			Text:           part,
 			CreatedAt:      now.Add(time.Duration(index) * time.Nanosecond),
-		})
+		}
+		if index == 0 && len(edits) > 0 {
+			outbox.EditMessageID = edits[0].MessageID
+			outbox.Buttons = edits[0].Buttons
+		}
+		messages = append(messages, outbox)
 	}
 	return messages
+}
+
+func (s *Service) createJobStatus(job store.PendingJob, message string, buttons [][]transport.Button) {
+	sender := s.sender(job.Address())
+	editor, ok := sender.(transport.StatusEditor)
+	if !ok {
+		s.send(job.Address(), message)
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	messageID, err := editor.CreateStatus(ctx, job.ConversationID, message, buttons)
+	if err != nil {
+		s.log.Warn("create task status failed", "job_id", job.ID, "transport", job.Transport, "error_type", fmt.Sprintf("%T", err))
+		s.send(job.Address(), message)
+		return
+	}
+	if err := s.store.SetJobStatusMessage(job.ID, messageID); err != nil {
+		s.log.Error("persist task status message", "job_id", job.ID, "error_type", fmt.Sprintf("%T", err))
+	}
+}
+
+func (s *Service) editJobStatus(job store.PendingJob, message string, buttons [][]transport.Button) {
+	if job.StatusMessageID == "" {
+		return
+	}
+	sender := s.sender(job.Address())
+	editor, ok := sender.(transport.StatusEditor)
+	if !ok {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	if err := editor.EditStatus(ctx, job.ConversationID, job.StatusMessageID, message, buttons); err != nil {
+		s.log.Warn("edit task status failed", "job_id", job.ID, "transport", job.Transport, "error_type", fmt.Sprintf("%T", err))
+	}
+}
+
+func cancelButtons(jobID int64) [][]transport.Button {
+	return [][]transport.Button{{{Text: "Cancel task", Data: fmt.Sprintf("canceljob:%d", jobID)}}}
+}
+
+func retryButtons(jobID int64) [][]transport.Button {
+	return [][]transport.Button{{{Text: "Retry task", Data: fmt.Sprintf("retryjob:%d", jobID)}}}
+}
+
+func clearQueueButtons() [][]transport.Button {
+	return [][]transport.Button{{{Text: "Clear queue", Data: "clearqueue"}}}
 }
 
 func (s *Service) sender(address transport.Address) transport.Sender {
@@ -136,6 +247,32 @@ func shortID(id string) string {
 	return id[:8]
 }
 
+func jobReference(id int64) string {
+	if id < 0 {
+		return "d-" + strconv.FormatUint(uint64(-id), 36)
+	}
+	return "t-" + strconv.FormatUint(uint64(id), 36)
+}
+
+func parseJobReference(value string) (int64, error) {
+	value = strings.ToLower(strings.TrimSpace(value))
+	sign := int64(1)
+	switch {
+	case strings.HasPrefix(value, "d-"):
+		sign = -1
+		value = strings.TrimPrefix(value, "d-")
+	case strings.HasPrefix(value, "t-"):
+		value = strings.TrimPrefix(value, "t-")
+	default:
+		return strconv.ParseInt(value, 10, 64)
+	}
+	id, err := strconv.ParseUint(value, 36, 63)
+	if err != nil {
+		return 0, err
+	}
+	return int64(id) * sign, nil
+}
+
 const helpText = `Agent Relay commands:
 /projects — list discovered Git projects
 /project <id> — select a project
@@ -153,5 +290,5 @@ const helpText = `Agent Relay commands:
 /refresh — rescan configured project roots
 /help — show this message
 
-On Discord, use ! in place of / (for example, !projects).
+Discord supports native slash commands; ! aliases remain available.
 Send any other text to the selected agent in the selected project.`

@@ -47,24 +47,27 @@ type Conversation struct {
 }
 
 type PendingJob struct {
-	ID             int64     `json:"id"`
-	Transport      string    `json:"transport"`
-	ConversationID string    `json:"conversation_id"`
-	ProjectID      string    `json:"project_id"`
-	ProjectPath    string    `json:"project_path"`
-	AgentName      string    `json:"agent_name"`
-	Prompt         string    `json:"prompt"`
-	State          JobState  `json:"state"`
-	CreatedAt      time.Time `json:"created_at"`
+	ID              int64     `json:"id"`
+	Transport       string    `json:"transport"`
+	ConversationID  string    `json:"conversation_id"`
+	ProjectID       string    `json:"project_id"`
+	ProjectPath     string    `json:"project_path"`
+	AgentName       string    `json:"agent_name"`
+	Prompt          string    `json:"prompt"`
+	StatusMessageID string    `json:"status_message_id,omitempty"`
+	State           JobState  `json:"state"`
+	CreatedAt       time.Time `json:"created_at"`
 }
 
 type OutboxMessage struct {
-	ID             string    `json:"id"`
-	Transport      string    `json:"transport"`
-	ConversationID string    `json:"conversation_id"`
-	Text           string    `json:"text"`
-	CreatedAt      time.Time `json:"created_at"`
-	Attempts       int       `json:"attempts"`
+	ID             string               `json:"id"`
+	Transport      string               `json:"transport"`
+	ConversationID string               `json:"conversation_id"`
+	Text           string               `json:"text"`
+	EditMessageID  string               `json:"edit_message_id,omitempty"`
+	Buttons        [][]transport.Button `json:"buttons,omitempty"`
+	CreatedAt      time.Time            `json:"created_at"`
+	Attempts       int                  `json:"attempts"`
 }
 
 type state struct {
@@ -88,7 +91,7 @@ func Open(path string) (*Store, error) {
 	store := &Store{
 		path: path,
 		data: state{
-			Version:         4,
+			Version:         5,
 			Selected:        make(map[string]string),
 			SelectedAgents:  make(map[string]string),
 			Conversations:   make(map[string]Conversation),
@@ -126,8 +129,14 @@ func Open(path string) (*Store, error) {
 	if store.data.ProcessedEvents == nil {
 		store.data.ProcessedEvents = make(map[string]time.Time)
 	}
-	if store.data.Version != 4 {
-		return nil, fmt.Errorf("unsupported state version %d; remove the state file to initialize version 4", store.data.Version)
+	if store.data.Version == 4 {
+		store.data.Version = 5
+		if err := store.persistLocked(); err != nil {
+			return nil, fmt.Errorf("migrate state: %w", err)
+		}
+	}
+	if store.data.Version != 5 {
+		return nil, fmt.Errorf("unsupported state version %d; remove the state file to initialize version 5", store.data.Version)
 	}
 	return store, nil
 }
@@ -273,6 +282,18 @@ func (s *Store) SetJobState(id int64, state JobState) error {
 		return fmt.Errorf("job %d not found", id)
 	}
 	job.State = state
+	s.data.Jobs[jobKey(id)] = job
+	return s.persistLocked()
+}
+
+func (s *Store) SetJobStatusMessage(id int64, messageID string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	job, ok := s.data.Jobs[jobKey(id)]
+	if !ok {
+		return fmt.Errorf("job %d not found", id)
+	}
+	job.StatusMessageID = messageID
 	s.data.Jobs[jobKey(id)] = job
 	return s.persistLocked()
 }

@@ -80,12 +80,15 @@ message bodies or the bot token.
    it a direct message.
 4. In Discord Developer Mode, right-click your account, select **Copy User ID**,
    and add the string ID to `discord.allowed_user_ids`.
-5. Enable the transport, start Agent Relay, then send the bot `!help`.
+5. Enable the transport, start Agent Relay, then use the bot's `/help` command.
 
 Discord uses the Gateway WebSocket initiated by Agent Relay. No interactions
 webhook URL, public HTTP endpoint, or inbound firewall rule is required. Direct
 messages are required by default. Set `private_channels_only = false` only when
 you intentionally want allowlisted users to operate the bot in server channels.
+Agent Relay registers its global slash-command set at startup and owns that
+application's command definitions. Project and agent options provide
+autocomplete. Text aliases such as `!status` remain available.
 
 ## Configuration
 
@@ -179,18 +182,19 @@ targets that escape a root are rejected. Without an alias, a repository's
 lowercase directory name is its project ID. Duplicate names receive IDs derived
 from their relative paths.
 
-The JSON state file records transport conversation IDs, Telegram update offsets,
-processed Discord events, selected projects and agents, agent session IDs,
-pending prompts, interrupted jobs, last responses, and undelivered messages. It
-therefore contains sensitive project instructions and uses mode `0600`. Full
-conversation history remains in each CLI's own data directory. Preserve both
-when migrating or backing up sessions.
+The JSON state file records transport conversation and status-message IDs,
+Telegram update offsets, processed Discord events, selected projects and agents,
+agent session IDs, pending prompts, interrupted jobs, last responses, action
+buttons, and undelivered messages. It therefore contains sensitive project
+instructions and uses mode `0600`. Full conversation history remains in each
+CLI's own data directory. Preserve both when migrating or backing up sessions.
 
 ## Build and Run
 
 ```sh
 make build
 ./agent-relay validate --config ./config.toml
+./agent-relay doctor --config ./config.toml
 ./agent-relay projects --config ./config.toml
 ./agent-relay run --config ./config.toml
 ```
@@ -203,6 +207,10 @@ go install github.com/sovereign313/Agent-Relay/cmd/agent-relay@latest
 
 `validate` checks project discovery and verifies every enabled CLI's version,
 session-resume support, structured output mode, and approval-bypass flag.
+`doctor` additionally checks writable project/state/log directories, bot
+credentials, outbound transport connectivity, Discord Gateway identification,
+and each enabled agent. Stop a running daemon before invoking `doctor` so its
+Discord probe does not compete for a Gateway identify session.
 
 Systemd is not required. A simple detached startup is:
 
@@ -225,22 +233,26 @@ user, paths, and agent credentials before installing it.
 - `/retry <job-id>`: explicitly retry a job interrupted by a daemon restart.
 - `/new`: discard the selected project/agent session and start fresh next turn.
 - `/last`: resend the last completed response for the selected project and agent.
-- `/status`: show version, agent, project, state, queue, and session.
+- `/status`: show version, transport health, agent, project, queue, delivery,
+  and session state.
 - `/cancel`: interrupt the current agent process.
 - `/cancelall`: interrupt all running tasks belonging to the current chat.
 - `/refresh`: rescan configured project roots.
 - `/help`: show command help.
 
-Normal text is queued for the selected project and agent. Each
+Normal text creates one editable task message with its short job reference,
+queue position, and a Cancel or Clear Queue button. The same message is updated
+when work starts and is replaced by the final response. Each
 conversation/project/agent queue is bounded, and tasks targeting the same
 canonical repository are serialized even when they come from different
 transports, conversations, or agents. Telegram uses the commands exactly as
-shown. On Discord, replace `/` with `!`, such as `!project harness-studio`.
+shown. Discord provides native slash commands and project/agent autocomplete;
+`!project harness-studio`-style aliases also work.
 
 If Agent Relay stops while an agent process is active, the job becomes
 `interrupted` on restart and is not automatically replayed. This prevents a
 possibly destructive request from running twice. Inspect it with `/queue`, then
-use `/retry <job-id>` or `/clearqueue`.
+use its Retry button, `/retry <job-id>`, or `/clearqueue`.
 
 ## How Sessions Work
 
@@ -280,9 +292,11 @@ Each adapter validates the CLI capabilities it depends on at daemon startup.
 CLI output protocols can change, so upgrades may require adapter fixture
 updates.
 
-Transport clients handle their own transient errors. A final response that
-cannot be delivered remains in the outbox for periodic retry and is also
-available through `/last` or `!last`.
+Final-response delivery is durable. A response that cannot be delivered remains
+in the outbox for periodic retry; if its editable status message was deleted,
+Agent Relay falls back to sending a separate response. Pending delivery counts
+and attempts appear in `/status`, and the last result remains available through
+`/last` or `!last`.
 
 ## Troubleshooting
 
@@ -300,10 +314,13 @@ available through `/last` or `!last`.
   Relay, or configure the provider's API-key environment.
 - **Validation reports a missing capability:** upgrade the affected CLI or
   disable its profile before starting the daemon.
+- **General startup or connectivity failure:** stop the daemon and run
+  `agent-relay doctor --config ./config.toml`.
 - **Telegram receives no response:** inspect structured logs, verify outbound
   HTTPS access to `api.telegram.org`, and run `validate`.
 - **Discord receives no response:** verify the bot token, Message Content
-  intent, copied user ID, outbound WebSocket access, and `discord.enabled`.
+  intent, copied user ID, outbound WebSocket access, slash-command registration,
+  and `discord.enabled`.
 - **Task will not stop:** `/cancel` sends `SIGINT` to the agent process group;
   after a grace period Go terminates a process that does not exit.
 

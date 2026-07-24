@@ -40,6 +40,9 @@ type Service struct {
 	dispatchMu    sync.Mutex
 	dispatched    map[int64]bool
 	deliveryMu    sync.Mutex
+	commandMu     sync.Mutex
+	replyMu       sync.Mutex
+	replies       map[transport.Address]string
 	outboxWake    chan struct{}
 	startedAt     time.Time
 	version       string
@@ -75,6 +78,7 @@ func New(
 		catalog:       catalog,
 		runners:       runners,
 		dispatched:    make(map[int64]bool),
+		replies:       make(map[transport.Address]string),
 		outboxWake:    make(chan struct{}, 1),
 		startedAt:     time.Now().UTC(),
 		version:       version,
@@ -97,7 +101,9 @@ func (s *Service) Run(ctx context.Context) error {
 			ID:             fmt.Sprintf("interrupted:%d", job.ID),
 			Transport:      job.Transport,
 			ConversationID: job.ConversationID,
-			Text:           fmt.Sprintf("Job %d for %s in %s was interrupted by an Agent Relay restart. Select that project and agent, then use /retry %d to run it again or /clearqueue to discard it.", job.ID, job.AgentName, job.ProjectID, job.ID),
+			Text:           fmt.Sprintf("Job %s for %s in %s was interrupted by an Agent Relay restart. Select that project and agent, then use /retry %s to run it again or /clearqueue to discard it.", jobReference(job.ID), job.AgentName, job.ProjectID, jobReference(job.ID)),
+			EditMessageID:  job.StatusMessageID,
+			Buttons:        retryButtons(job.ID),
 			CreatedAt:      time.Now().UTC(),
 		}
 		if err := s.store.PutOutbox(message); err != nil {
@@ -226,6 +232,9 @@ func (s *Service) handleInbound(ctx context.Context, inbound transport.Inbound) 
 	if !inbound.Address.Valid() || inbound.EventID == "" {
 		return fmt.Errorf("invalid inbound transport event")
 	}
+	if inbound.Autocomplete != nil {
+		return s.handleAutocomplete(ctx, inbound.Address, inbound.Autocomplete)
+	}
 	text := strings.TrimSpace(inbound.Text)
 	if len([]byte(text)) > s.cfg.MaxMessageBytes {
 		if _, err := s.acceptInbound(inbound, nil, nil); err != nil {
@@ -239,7 +248,9 @@ func (s *Service) handleInbound(ctx context.Context, inbound transport.Inbound) 
 		if err != nil || !accepted {
 			return err
 		}
-		s.handleAction(inbound.Address, inbound.Action)
+		s.withResponse(inbound, func() {
+			s.handleAction(inbound.Address, inbound.Action)
+		})
 		return nil
 	}
 	if text == "" {
@@ -251,10 +262,62 @@ func (s *Service) handleInbound(ctx context.Context, inbound transport.Inbound) 
 		if err != nil || !accepted {
 			return err
 		}
-		s.handleCommand(ctx, inbound.Address, text)
+		s.withResponse(inbound, func() {
+			s.handleCommand(ctx, inbound.Address, text)
+		})
 		return nil
 	}
 	return s.acceptJob(inbound)
+}
+
+func (s *Service) withResponse(inbound transport.Inbound, handle func()) {
+	s.commandMu.Lock()
+	defer s.commandMu.Unlock()
+	if inbound.ResponseID != "" {
+		s.replyMu.Lock()
+		s.replies[inbound.Address] = inbound.ResponseID
+		s.replyMu.Unlock()
+		defer func() {
+			s.replyMu.Lock()
+			delete(s.replies, inbound.Address)
+			s.replyMu.Unlock()
+		}()
+	}
+	handle()
+}
+
+func (s *Service) handleAutocomplete(ctx context.Context, address transport.Address, request *transport.Autocomplete) error {
+	sender := s.sender(address)
+	responder, ok := sender.(transport.AutocompleteResponder)
+	if !ok {
+		return transport.ErrUnsupported
+	}
+	query := strings.ToLower(strings.TrimSpace(request.Query))
+	var choices []transport.Choice
+	switch request.Command {
+	case "project":
+		for _, item := range s.listProjects() {
+			if query != "" && !strings.Contains(strings.ToLower(item.ID+" "+item.RelativePath), query) {
+				continue
+			}
+			choices = append(choices, transport.Choice{Name: item.ID, Value: item.ID})
+			if len(choices) == 25 {
+				break
+			}
+		}
+	case "agent":
+		names := make([]string, 0, len(s.runners))
+		for name := range s.runners {
+			names = append(names, name)
+		}
+		sort.Strings(names)
+		for _, name := range names {
+			if query == "" || strings.Contains(name, query) {
+				choices = append(choices, transport.Choice{Name: name, Value: name})
+			}
+		}
+	}
+	return responder.AnswerAutocomplete(ctx, request.ID, choices)
 }
 
 func (s *Service) acceptInbound(inbound transport.Inbound, job *store.PendingJob, conversation *store.Conversation) (bool, error) {
@@ -307,7 +370,7 @@ func (s *Service) handleCommand(ctx context.Context, address transport.Address, 
 			s.send(address, "Usage: /retry <job-id>")
 			return
 		}
-		jobID, err := strconv.ParseInt(fields[1], 10, 64)
+		jobID, err := parseJobReference(fields[1])
 		if err != nil {
 			s.send(address, "Job ID must be a number.")
 			return
@@ -351,6 +414,25 @@ func (s *Service) handleCallback(update telegram.Update) error {
 
 func (s *Service) handleAction(address transport.Address, action *transport.Action) {
 	switch {
+	case action.Data == "clearqueue":
+		s.clearQueue(address)
+		s.answerAction(address.Transport, action.ID, "Queue cleared")
+	case strings.HasPrefix(action.Data, "canceljob:"):
+		jobID, err := strconv.ParseInt(strings.TrimPrefix(action.Data, "canceljob:"), 10, 64)
+		if err != nil {
+			s.answerAction(address.Transport, action.ID, "Invalid job")
+			return
+		}
+		s.cancelJob(address, jobID)
+		s.answerAction(address.Transport, action.ID, "Cancellation requested")
+	case strings.HasPrefix(action.Data, "retryjob:"):
+		jobID, err := strconv.ParseInt(strings.TrimPrefix(action.Data, "retryjob:"), 10, 64)
+		if err != nil {
+			s.answerAction(address.Transport, action.ID, "Invalid job")
+			return
+		}
+		s.retryJob(address, jobID)
+		s.answerAction(address.Transport, action.ID, "Retry requested")
 	case strings.HasPrefix(action.Data, "project:"):
 		projectID := strings.TrimPrefix(action.Data, "project:")
 		if _, ok := s.getProject(projectID); !ok {
@@ -370,6 +452,21 @@ func (s *Service) handleAction(address transport.Address, action *transport.Acti
 	default:
 		s.answerAction(address.Transport, action.ID, "Unknown action")
 	}
+}
+
+func (s *Service) cancelJob(address transport.Address, jobID int64) {
+	job, ok := s.store.Job(jobID)
+	if !ok || job.Address() != address {
+		s.send(address, "That task is no longer active.")
+		return
+	}
+	key := session.Key{Address: address, ProjectID: job.ProjectID, AgentName: job.AgentName}
+	status := s.sessions.Status(key)
+	if !status.Working || status.CurrentID != jobID || !s.sessions.Cancel(key) {
+		s.send(address, "That task is queued. Use /clearqueue to remove queued tasks.")
+		return
+	}
+	s.send(address, fmt.Sprintf("Cancelling %s in %s...\nJob: %s", job.AgentName, job.ProjectID, jobReference(job.ID)))
 }
 
 func (s *Service) selectProject(address transport.Address, id string) {
@@ -489,6 +586,13 @@ func (s *Service) clearQueue(address transport.Address) {
 	if status.Working {
 		excludeID = status.CurrentID
 	}
+	candidates := make(map[int64]store.PendingJob)
+	for _, job := range s.store.Jobs() {
+		if job.Address() == address && job.ProjectID == projectID && job.AgentName == agentName &&
+			job.State != store.JobWorking && job.ID != excludeID {
+			candidates[job.ID] = job
+		}
+	}
 	removedMemory := s.sessions.ClearQueue(key)
 	for _, job := range removedMemory {
 		s.markDispatched(job.ID, false)
@@ -501,6 +605,9 @@ func (s *Service) clearQueue(address transport.Address) {
 	}
 	for _, id := range removed {
 		s.markDispatched(id, false)
+		if job, ok := candidates[id]; ok {
+			s.editJobStatus(job, fmt.Sprintf("Task removed from the queue.\nJob: %s", jobReference(id)), nil)
+		}
 	}
 	if !status.Working {
 		if conversation, exists := s.store.Conversation(address, projectID, agentName); exists && conversation.State == store.StateQueued {
@@ -531,6 +638,7 @@ func (s *Service) retryJob(address transport.Address, jobID int64) {
 		s.send(address, safeError(err))
 		return
 	}
+	s.editJobStatus(job, fmt.Sprintf("Queued for retry with %s in %s.\nJob: %s", job.AgentName, job.ProjectID, jobReference(job.ID)), clearQueueButtons())
 	if conversation, exists := s.store.Conversation(address, job.ProjectID, job.AgentName); exists {
 		conversation.State = store.StateQueued
 		conversation.LastActivity = time.Now().UTC()
@@ -545,9 +653,9 @@ func (s *Service) retryJob(address transport.Address, jobID int64) {
 		return
 	}
 	if queued {
-		s.send(address, fmt.Sprintf("Job %d was queued.", jobID))
+		s.send(address, fmt.Sprintf("Job %s was queued.", jobReference(jobID)))
 	} else {
-		s.send(address, fmt.Sprintf("Retrying job %d with %s in %s...", jobID, job.AgentName, job.ProjectID))
+		s.send(address, fmt.Sprintf("Retrying job %s with %s in %s...", jobReference(jobID), job.AgentName, job.ProjectID))
 	}
 }
 
@@ -603,16 +711,7 @@ func (s *Service) sendProjects(address transport.Address) {
 	if len(row) > 0 {
 		rows = append(rows, row)
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer cancel()
-	sender := s.sender(address)
-	if sender == nil {
-		s.log.Error("send project keyboard", "address", address, "error", "transport unavailable")
-		return
-	}
-	if err := sender.SendKeyboard(ctx, address.ConversationID, message, rows); err != nil {
-		s.log.Error("send project keyboard", "address", address, "error_type", fmt.Sprintf("%T", err))
-	}
+	s.sendKeyboard(address, message, rows)
 }
 
 func (s *Service) agentsMessage(address transport.Address) string {
@@ -647,16 +746,7 @@ func (s *Service) sendAgents(address transport.Address) {
 		}
 		rows = append(rows, row)
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer cancel()
-	sender := s.sender(address)
-	if sender == nil {
-		s.log.Error("send agent keyboard", "address", address, "error", "transport unavailable")
-		return
-	}
-	if err := sender.SendKeyboard(ctx, address.ConversationID, s.agentsMessage(address), rows); err != nil {
-		s.log.Error("send agent keyboard", "address", address, "error_type", fmt.Sprintf("%T", err))
-	}
+	s.sendKeyboard(address, s.agentsMessage(address), rows)
 }
 
 func (s *Service) sessionsMessage(address transport.Address) string {
@@ -699,7 +789,7 @@ func (s *Service) queueMessage(address transport.Address) string {
 		if len(preview) > 72 {
 			preview = preview[:72] + "..."
 		}
-		lines = append(lines, fmt.Sprintf("%d — %s — %s", job.ID, job.State, preview))
+		lines = append(lines, fmt.Sprintf("%s — %s — %s", jobReference(job.ID), job.State, preview))
 	}
 	return strings.Join(lines, "\n")
 }
@@ -707,12 +797,22 @@ func (s *Service) queueMessage(address transport.Address) string {
 func (s *Service) statusMessage(address transport.Address) string {
 	agentName := s.selectedAgent(address)
 	runtime := fmt.Sprintf(
-		"Agent Relay: %s\nAgent: %s (%s)\nUptime: %s",
+		"Agent Relay: %s\nTransport: %s\nAgent: %s (%s)\nUptime: %s",
 		s.version,
+		s.transportStatus(address),
 		agentName,
 		s.agentVersions[agentName],
 		formatUptime(time.Since(s.startedAt)),
 	)
+	pendingDeliveries := 0
+	deliveryAttempts := 0
+	for _, message := range s.store.Outbox() {
+		if message.Address() == address {
+			pendingDeliveries++
+			deliveryAttempts += message.Attempts
+		}
+	}
+	runtime += fmt.Sprintf("\nPending deliveries: %d\nDelivery attempts: %d", pendingDeliveries, deliveryAttempts)
 	projectID := s.store.SelectedProject(address)
 	if projectID == "" {
 		return runtime + "\nProject: not selected"
@@ -752,6 +852,21 @@ func (s *Service) statusMessage(address transport.Address) string {
 		durableJobs,
 		thread,
 	)
+}
+
+func (s *Service) transportStatus(address transport.Address) string {
+	reporter, ok := s.sender(address).(transport.HealthReporter)
+	if !ok {
+		return "available"
+	}
+	health := reporter.Health()
+	if health.State == "" {
+		health.State = "unknown"
+	}
+	if health.Detail == "" {
+		return health.State
+	}
+	return health.State + " (" + health.Detail + ")"
 }
 
 func (s *Service) refreshCatalog() error {

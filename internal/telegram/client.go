@@ -91,6 +91,14 @@ func (c *Client) GetUpdates(ctx context.Context, offset int64) ([]Update, error)
 	return updates, nil
 }
 
+func (c *Client) GetMe(ctx context.Context) (User, error) {
+	var user User
+	if err := c.call(ctx, http.MethodPost, "getMe", nil, &user); err != nil {
+		return User{}, err
+	}
+	return user, nil
+}
+
 func (c *Client) Send(ctx context.Context, chatID int64, message string) error {
 	return c.send(ctx, chatID, message, nil)
 }
@@ -112,28 +120,56 @@ func (c *Client) AnswerCallback(ctx context.Context, callbackID, text string) er
 	return c.call(ctx, http.MethodPost, "answerCallbackQuery", values, nil)
 }
 
+func (c *Client) CreateStatus(ctx context.Context, chatID int64, message string, rows [][]Button) (int64, error) {
+	if rows == nil {
+		rows = make([][]Button, 0)
+	}
+	keyboard, err := json.Marshal(inlineKeyboard{Rows: rows})
+	if err != nil {
+		return 0, err
+	}
+	values := messageValues(chatID, message)
+	values.Set("reply_markup", string(keyboard))
+	var sent Message
+	if err := c.sendWithRetry(ctx, "sendMessage", values, &sent); err != nil {
+		return 0, err
+	}
+	return sent.MessageID, nil
+}
+
+func (c *Client) EditStatus(ctx context.Context, chatID, messageID int64, message string, rows [][]Button) error {
+	if rows == nil {
+		rows = make([][]Button, 0)
+	}
+	keyboard, err := json.Marshal(inlineKeyboard{Rows: rows})
+	if err != nil {
+		return err
+	}
+	values := messageValues(chatID, message)
+	values.Set("message_id", strconv.FormatInt(messageID, 10))
+	values.Set("reply_markup", string(keyboard))
+	return c.sendWithRetry(ctx, "editMessageText", values, nil)
+}
+
 func (c *Client) send(ctx context.Context, chatID int64, message string, keyboard []byte) error {
 	message = Sanitize(message)
 	parts := Split(message, MaxMessageLength)
 	for index, part := range parts {
-		values := url.Values{}
-		values.Set("chat_id", strconv.FormatInt(chatID, 10))
-		values.Set("text", part)
-		values.Set("disable_web_page_preview", "true")
+		values := messageValues(chatID, part)
 		if index == len(parts)-1 && len(keyboard) > 0 {
 			values.Set("reply_markup", string(keyboard))
 		}
-		if err := c.sendWithRetry(ctx, values); err != nil {
+		if err := c.sendWithRetry(ctx, "sendMessage", values, nil); err != nil {
 			return err
 		}
 	}
 	return nil
 }
 
-func (c *Client) sendWithRetry(ctx context.Context, values url.Values) error {
+func (c *Client) sendWithRetry(ctx context.Context, endpoint string, values url.Values, destination any) error {
 	var lastErr error
 	for attempt := 0; attempt < sendAttempts; attempt++ {
-		lastErr = c.call(ctx, http.MethodPost, "sendMessage", values, nil)
+		lastErr = c.call(ctx, http.MethodPost, endpoint, values, destination)
 		if lastErr == nil {
 			return nil
 		}
@@ -157,6 +193,14 @@ func (c *Client) sendWithRetry(ctx context.Context, values url.Values) error {
 		}
 	}
 	return lastErr
+}
+
+func messageValues(chatID int64, message string) url.Values {
+	values := url.Values{}
+	values.Set("chat_id", strconv.FormatInt(chatID, 10))
+	values.Set("text", Sanitize(message))
+	values.Set("disable_web_page_preview", "true")
+	return values
 }
 
 func (c *Client) call(ctx context.Context, method, endpoint string, values url.Values, destination any) error {

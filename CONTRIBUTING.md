@@ -1,7 +1,8 @@
 # Contributing
 
-Agent Relay exposes a coding agent through Telegram, so changes should preserve
-its authorization boundaries, durable job semantics, and redaction guarantees.
+Agent Relay exposes coding agents through remote messaging transports, so
+changes should preserve its authorization boundaries, durable job semantics,
+and redaction guarantees.
 
 ## Development
 
@@ -20,16 +21,16 @@ make build
 
 `make check` runs unit tests, `go vet`, and the race detector. Add focused tests
 for behavior changes, particularly around persistence, queue transitions,
-authorization, process cancellation, and Telegram delivery retries.
+authorization, process cancellation, interaction handling, and durable delivery.
 
 ## Pull Requests
 
 - Keep changes focused and explain the user-visible behavior.
 - Do not commit bot tokens, agent credentials, state files, logs, prompts, or
   private repository content.
-- Document new configuration keys and Telegram commands in the README and
+- Document new configuration keys and bot commands in the README and
   example configuration.
-- Note any manual agent or Telegram validation performed.
+- Note any manual agent or transport validation performed.
 - Call out changes that broaden filesystem, process, or network access.
 
 Use GitHub's private security advisory flow for vulnerabilities rather than a
