@@ -5,7 +5,7 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
 Agent Relay lets an authorized Telegram or Discord user run Codex, Claude Code,
-OpenCode, or Grok Build against Git repositories on a Linux PC. Each transport
+OpenCode, or Grok Build against project directories on a Linux PC. Each transport
 conversation, project, and agent gets its own durable session, so switching
 tools or projects and returning later resumes the correct conversation.
 
@@ -47,7 +47,7 @@ credentials, state file, and logs with restrictive permissions.
   [Claude Code](https://code.claude.com/docs/en/cli-usage),
   [OpenCode](https://opencode.ai/docs/cli/), or
   [Grok Build](https://docs.x.ai/build/overview)
-- Git repositories beneath one or more configured project roots
+- Project directories beneath one or more configured project roots
 - A Telegram bot token, a Discord bot token, or both
 
 Verify the CLIs you plan to enable before starting:
@@ -178,9 +178,13 @@ require mode `0600`. Agent Relay removes those named variables from the
 environment inherited by all agent child processes.
 
 Project aliases are relative to a configured root. Absolute paths and alias
-targets that escape a root are rejected. Without an alias, a repository's
-lowercase directory name is its project ID. Duplicate names receive IDs derived
-from their relative paths.
+targets that escape a root are rejected. Bot directory browsing is non-recursive:
+`/projects` lists the root's immediate child directories, and
+`/projects hiperfusion` lists only that directory's immediate children.
+`/project hiperfusion/HarnessStudio` selects any existing directory beneath the
+root, even when it is not a Git repository. Absolute paths, `..` traversal, and
+symlinks escaping a configured root are rejected. Configured aliases remain
+available as shorter selection names.
 
 The JSON state file records transport conversation and status-message IDs,
 Telegram update offsets, processed Discord events, selected projects and agents,
@@ -223,8 +227,10 @@ user, paths, and agent credentials before installing it.
 
 ## Bot Commands
 
-- `/projects` or `/list`: list discovered projects with selection buttons.
-- `/project <id>`: select a project and resume its existing context when present.
+- `/projects [relative-path]` or `/list [relative-path]`: list only the immediate
+  subdirectories at that location, with navigation buttons.
+- `/project <relative-path>`: select any directory beneath a configured project
+  root and resume its existing context when present.
 - `/agents`: list enabled agents with selection buttons.
 - `/agent <name>`: select an agent and resume its project context when present.
 - `/sessions`: list saved project contexts for the current chat.
@@ -244,7 +250,7 @@ Normal text creates one editable task message with its short job reference,
 queue position, and a Cancel or Clear Queue button. The same message is updated
 when work starts and is replaced by the final response. Each
 conversation/project/agent queue is bounded, and tasks targeting the same
-canonical repository are serialized even when they come from different
+canonical directory are serialized even when they come from different
 transports, conversations, or agents. Telegram uses the commands exactly as
 shown. Discord provides native slash commands and project/agent autocomplete;
 `!project harness-studio`-style aliases also work.
@@ -300,8 +306,10 @@ and attempts appear in `/status`, and the last result remains available through
 
 ## Troubleshooting
 
-- **No projects found:** confirm each project contains a `.git` directory or
-  worktree `.git` file and is within `project_discovery_depth`.
+- **No projects found in the CLI:** `agent-relay projects` reports Git
+  repositories; confirm each contains a `.git` directory or worktree `.git`
+  file and is within `project_discovery_depth`. Bot `/projects` browsing lists
+  directories and does not require Git.
 - **Alias rejected:** aliases must resolve to a discovered Git repository below
   one configured root and may not be absolute.
 - **Resume fails:** confirm the selected CLI's session data still exists and

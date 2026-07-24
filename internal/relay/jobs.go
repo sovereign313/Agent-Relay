@@ -21,7 +21,7 @@ func (s *Service) acceptJob(inbound transport.Inbound) error {
 		if _, err := s.acceptInbound(inbound, nil, nil); err != nil {
 			return err
 		}
-		s.send(address, "Select a project first with /projects and /project <project-id>.")
+		s.send(address, "Select a project first with /projects and /project <relative-path>.")
 		return nil
 	}
 	selected, ok := s.getProject(projectID)

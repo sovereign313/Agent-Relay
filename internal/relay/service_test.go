@@ -3,6 +3,7 @@ package relay
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"os"
@@ -239,7 +240,7 @@ state_file = "./state.json"
 	}); err != nil {
 		t.Fatal(err)
 	}
-	if choices := discordSender.Choices(); len(choices) != 1 || choices[0].Value != "alpha" {
+	if choices := discordSender.Choices(); len(choices) != 1 || choices[0].Value != "Alpha" {
 		t.Fatalf("project autocomplete choices = %#v", choices)
 	}
 	if err := service.handleInbound(ctx, transport.Inbound{
@@ -270,6 +271,59 @@ state_file = "./state.json"
 	edits := discordSender.StatusEdits()
 	if len(edits) < 2 || edits[len(edits)-1].text != "done" || len(edits[len(edits)-1].buttons) != 0 {
 		t.Fatalf("Discord status edits = %#v", edits)
+	}
+}
+
+func TestServiceBrowsesAndSelectsNonGitDirectory(t *testing.T) {
+	root := t.TempDir()
+	work := filepath.Join(root, "Group", "Work Space")
+	if err := os.MkdirAll(filepath.Join(work, "Nested"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	configPath := filepath.Join(root, "config.toml")
+	configData := `telegram_token = "test-token"
+allowed_user_ids = [42]
+project_roots = ["` + root + `"]
+state_file = "./state.json"
+`
+	if err := os.WriteFile(configPath, []byte(configData), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := config.Load(configPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	catalog, err := project.Discover([]string{root}, nil, cfg.ProjectDiscoveryDepth)
+	if err != nil {
+		t.Fatal(err)
+	}
+	stateStore, err := store.Open(filepath.Join(root, "state.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	fakeTelegram := &recordingTelegram{}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	service := New(
+		ctx, cfg, slog.New(slog.NewTextHandler(io.Discard, nil)), fakeTelegram,
+		stateStore, catalog, map[string]agent.Runner{"codex": &recordingRunner{called: make(chan struct{}, 1)}},
+		"test", map[string]string{"codex": "test"},
+	)
+	defer service.sessions.Close()
+
+	if err := service.handleUpdate(ctx, textUpdate(1, "/projects group")); err != nil {
+		t.Fatal(err)
+	}
+	messages := fakeTelegram.Messages()
+	if len(messages) != 1 || !strings.Contains(messages[0], "Directories in Group:") ||
+		!strings.Contains(messages[0], "Work Space/") || strings.Contains(messages[0], "Nested/") {
+		t.Fatalf("browse response = %#v", messages)
+	}
+	if err := service.handleUpdate(ctx, textUpdate(2, "/project group/work space")); err != nil {
+		t.Fatal(err)
+	}
+	if selected := stateStore.SelectedProject(testAddress); selected != "Group/Work Space" {
+		t.Fatalf("selected project = %q, want Group/Work Space", selected)
 	}
 }
 
@@ -372,6 +426,12 @@ func (t *recordingTelegram) SendKeyboard(_ context.Context, _ string, message st
 
 func (t *recordingTelegram) AnswerAction(context.Context, string, string) error {
 	return nil
+}
+
+func (t *recordingTelegram) Messages() []string {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return append([]string(nil), t.messages...)
 }
 
 type recordingRunner struct {
@@ -487,6 +547,31 @@ func TestMakeOutboxMessagesPersistsChunksIndependently(t *testing.T) {
 		if len([]rune(part.Text)) > telegram.MaxMessageLength {
 			t.Fatalf("part exceeds Telegram limit: %d", len([]rune(part.Text)))
 		}
+	}
+}
+
+func TestDirectoryButtonsRespectTransportLimit(t *testing.T) {
+	projects := make([]project.Project, 120)
+	for index := range projects {
+		projects[index] = project.Project{ID: fmt.Sprintf("project-%03d", index)}
+	}
+
+	rows := directoryButtons(projects, 96)
+	buttons := 0
+	for _, row := range rows {
+		if len(row) > 2 {
+			t.Fatalf("row contains %d buttons", len(row))
+		}
+		buttons += len(row)
+	}
+	if buttons != 96 {
+		t.Fatalf("buttons = %d, want 96", buttons)
+	}
+	if len(rows) != 48 {
+		t.Fatalf("rows = %d, want 48", len(rows))
+	}
+	if rows[0][0].Data != "browse:project-000" {
+		t.Fatalf("first callback = %q", rows[0][0].Data)
 	}
 }
 

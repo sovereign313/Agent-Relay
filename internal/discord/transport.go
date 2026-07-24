@@ -442,7 +442,6 @@ func discordComponents(rows [][]transport.Button) []discordgo.MessageComponent {
 func applicationCommands() []*discordgo.ApplicationCommand {
 	simple := []struct{ name, description string }{
 		{"help", "Show Agent Relay commands"},
-		{"projects", "List available projects"},
 		{"agents", "List available coding agents"},
 		{"sessions", "List saved agent sessions"},
 		{"queue", "Show the selected task queue"},
@@ -458,8 +457,15 @@ func applicationCommands() []*discordgo.ApplicationCommand {
 	for _, item := range simple {
 		commands = append(commands, &discordgo.ApplicationCommand{Name: item.name, Description: item.description})
 	}
+	commands = append(commands, &discordgo.ApplicationCommand{
+		Name: "projects", Description: "Browse directories beneath the configured project roots",
+		Options: []*discordgo.ApplicationCommandOption{{
+			Type: discordgo.ApplicationCommandOptionString, Name: "path",
+			Description: "Optional relative directory path", Required: false,
+		}},
+	})
 	for _, item := range []struct{ name, description, option string }{
-		{"project", "Select a project", "project"},
+		{"project", "Select a project directory", "path"},
 		{"agent", "Select a coding agent", "agent"},
 		{"retry", "Retry an interrupted task", "job-id"},
 	} {

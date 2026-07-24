@@ -73,3 +73,89 @@ func TestDiscoverSupportsGitWorktreeFile(t *testing.T) {
 		t.Fatal("worktree repository was not discovered")
 	}
 }
+
+func TestBrowseDirectoryListsOnlyImmediateVisibleDirectories(t *testing.T) {
+	root := t.TempDir()
+	for _, relative := range []string{
+		"hiperfusion/HarnessStudio/.git",
+		"hiperfusion/RapidRFQ/.git",
+		"hiperfusion/.hidden",
+	} {
+		if err := os.MkdirAll(filepath.Join(root, relative), 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.WriteFile(filepath.Join(root, "hiperfusion", "README.md"), []byte("not a directory"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	catalog, err := Discover([]string{root}, nil, 3)
+	if err != nil {
+		t.Fatal(err)
+	}
+	listing, err := catalog.BrowseDirectory("HIPERFUSION")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if listing.RelativePath != "hiperfusion" {
+		t.Fatalf("relative path = %q, want hiperfusion", listing.RelativePath)
+	}
+	if len(listing.Entries) != 2 {
+		t.Fatalf("entries = %#v", listing.Entries)
+	}
+	if listing.Entries[0].ID != "hiperfusion/HarnessStudio" || listing.Entries[1].ID != "hiperfusion/RapidRFQ" {
+		t.Fatalf("entry IDs = %#v", listing.Entries)
+	}
+}
+
+func TestResolveDirectoryAllowsNonGitDirectoriesAndCanonicalizesCase(t *testing.T) {
+	root := t.TempDir()
+	want := filepath.Join(root, "Valkyrie", "Valk")
+	if err := os.MkdirAll(want, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	catalog, err := Discover([]string{root}, nil, 3)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	resolved, err := catalog.ResolveDirectory("valkyrie/valk")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resolved.Path != want || resolved.ID != "Valkyrie/Valk" {
+		t.Fatalf("resolved = %#v", resolved)
+	}
+}
+
+func TestResolveDirectoryRejectsTraversalAndEscapingSymlink(t *testing.T) {
+	parent := t.TempDir()
+	root := filepath.Join(parent, "projects")
+	outside := filepath.Join(parent, "outside")
+	if err := os.MkdirAll(root, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(outside, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(outside, filepath.Join(root, "escape")); err != nil {
+		t.Fatal(err)
+	}
+	catalog, err := Discover([]string{root}, nil, 3)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	for _, value := range []string{"../outside", "/tmp", "escape"} {
+		if _, err := catalog.ResolveDirectory(value); err == nil {
+			t.Fatalf("ResolveDirectory(%q) succeeded", value)
+		}
+	}
+	listing, err := catalog.BrowseDirectory("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(listing.Entries) != 0 {
+		t.Fatalf("escaping symlink was listed: %#v", listing.Entries)
+	}
+}

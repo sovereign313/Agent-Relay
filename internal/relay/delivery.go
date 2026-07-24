@@ -274,8 +274,8 @@ func parseJobReference(value string) (int64, error) {
 }
 
 const helpText = `Agent Relay commands:
-/projects — list discovered Git projects
-/project <id> — select a project
+/projects [path] — list immediate subdirectories beneath a project root
+/project <path> — select a directory beneath a project root
 /agents — list configured coding agents
 /agent <name> — select Codex, Claude, OpenCode, or Grok
 /sessions — list saved agent contexts

@@ -87,6 +87,10 @@ func TestApplicationCommandsIncludeNativeProjectAutocomplete(t *testing.T) {
 	if len(project.Options) != 1 || !project.Options[0].Autocomplete || !project.Options[0].Required {
 		t.Fatalf("project command options = %#v", project.Options)
 	}
+	projects := byName["projects"]
+	if projects == nil || len(projects.Options) != 1 || projects.Options[0].Required {
+		t.Fatalf("projects command options = %#v", projects)
+	}
 }
 
 func TestDiscordComponentsEnforceLimitsAndDangerStyle(t *testing.T) {

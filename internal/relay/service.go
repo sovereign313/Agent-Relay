@@ -296,8 +296,18 @@ func (s *Service) handleAutocomplete(ctx context.Context, address transport.Addr
 	var choices []transport.Choice
 	switch request.Command {
 	case "project":
-		for _, item := range s.listProjects() {
-			if query != "" && !strings.Contains(strings.ToLower(item.ID+" "+item.RelativePath), query) {
+		parent := ""
+		needle := query
+		if separator := strings.LastIndex(query, "/"); separator >= 0 {
+			parent = query[:separator]
+			needle = query[separator+1:]
+		}
+		listing, err := s.browseProjects(parent)
+		if err != nil {
+			break
+		}
+		for _, item := range listing.Entries {
+			if needle != "" && !strings.Contains(strings.ToLower(item.Name), needle) {
 				continue
 			}
 			choices = append(choices, transport.Choice{Name: item.ID, Value: item.ID})
@@ -330,25 +340,26 @@ func (s *Service) acceptInbound(inbound transport.Inbound, job *store.PendingJob
 func (s *Service) handleCommand(ctx context.Context, address transport.Address, text string) {
 	fields := strings.Fields(text)
 	command := strings.ToLower(strings.SplitN(fields[0], "@", 2)[0])
+	argument := strings.TrimSpace(strings.TrimPrefix(text, fields[0]))
 	switch command {
 	case "/start", "/help":
 		s.send(address, helpText)
 	case "/projects", "/list":
-		s.sendProjects(address)
+		s.sendProjects(address, argument)
 	case "/agents":
 		s.sendAgents(address)
 	case "/agent":
-		if len(fields) != 2 {
+		if argument == "" {
 			s.send(address, "Usage: /agent <agent-name>")
 			return
 		}
-		s.selectAgent(address, fields[1])
+		s.selectAgent(address, argument)
 	case "/project", "/use":
-		if len(fields) != 2 {
-			s.send(address, "Usage: /project <project-id>")
+		if argument == "" {
+			s.send(address, "Usage: /project <relative-path>")
 			return
 		}
-		s.selectProject(address, fields[1])
+		s.selectProject(address, argument)
 	case "/sessions":
 		s.send(address, s.sessionsMessage(address))
 	case "/queue":
@@ -366,11 +377,11 @@ func (s *Service) handleCommand(ctx context.Context, address transport.Address, 
 	case "/cancelall":
 		s.cancelAll(address)
 	case "/retry":
-		if len(fields) != 2 {
+		if argument == "" {
 			s.send(address, "Usage: /retry <job-id>")
 			return
 		}
-		jobID, err := parseJobReference(fields[1])
+		jobID, err := parseJobReference(argument)
 		if err != nil {
 			s.send(address, "Job ID must be a number.")
 			return
@@ -382,7 +393,7 @@ func (s *Service) handleCommand(ctx context.Context, address transport.Address, 
 			s.send(address, "Project refresh failed: "+safeError(err))
 			return
 		}
-		s.sendProjects(address)
+		s.sendProjects(address, "")
 	default:
 		s.send(address, "Unknown command. Use /help.")
 	}
@@ -441,6 +452,10 @@ func (s *Service) handleAction(address transport.Address, action *transport.Acti
 		}
 		s.selectProject(address, projectID)
 		s.answerAction(address.Transport, action.ID, "Selected "+projectID)
+	case strings.HasPrefix(action.Data, "browse:"):
+		path := strings.TrimPrefix(action.Data, "browse:")
+		s.sendProjects(address, path)
+		s.answerAction(address.Transport, action.ID, "Opened "+path)
 	case strings.HasPrefix(action.Data, "agent:"):
 		agentName := strings.TrimPrefix(action.Data, "agent:")
 		if _, ok := s.runners[agentName]; !ok {
@@ -472,7 +487,7 @@ func (s *Service) cancelJob(address transport.Address, jobID int64) {
 func (s *Service) selectProject(address transport.Address, id string) {
 	selected, ok := s.getProject(id)
 	if !ok {
-		s.send(address, "Unknown project. Run /projects to list available projects.")
+		s.send(address, "Unknown directory or path outside the configured project roots. Use /projects [relative-path] to browse.")
 		return
 	}
 	if err := s.store.SetSelectedProject(address, selected.ID); err != nil {
@@ -514,7 +529,7 @@ func (s *Service) selectAgent(address transport.Address, name string) {
 func (s *Service) newConversation(address transport.Address) {
 	projectID := s.store.SelectedProject(address)
 	if projectID == "" {
-		s.send(address, "Select a project first with /project <project-id>.")
+		s.send(address, "Select a project first with /project <relative-path>.")
 		return
 	}
 	agentName := s.selectedAgent(address)
@@ -674,35 +689,60 @@ func (s *Service) sendLast(address transport.Address) {
 	s.send(address, conversation.LastResponse)
 }
 
-func (s *Service) projectsMessage(address transport.Address) string {
+func (s *Service) projectsMessage(address transport.Address, listing project.Directory) string {
 	selected := s.store.SelectedProject(address)
-	projects := s.listProjects()
-	if len(projects) == 0 {
-		return "No Git projects were discovered beneath the configured roots."
+	location := listing.RelativePath
+	if location == "" || location == "." {
+		location = "/"
 	}
-	var lines []string
-	lines = append(lines, "Projects:")
-	for _, item := range projects {
+	lines := []string{"Directories in " + location + ":"}
+	if len(listing.Entries) == 0 {
+		lines = append(lines, "  No subdirectories.")
+	}
+	for _, item := range listing.Entries {
 		marker := "  "
 		if item.ID == selected {
 			marker = "* "
 		}
-		lines = append(lines, marker+item.ID+" — "+item.RelativePath)
+		lines = append(lines, marker+item.Name+"/")
 	}
+	lines = append(lines, "", "Browse: /projects <relative-path>", "Select: /project <relative-path>")
 	return strings.Join(lines, "\n")
 }
 
-func (s *Service) sendProjects(address transport.Address) {
-	message := s.projectsMessage(address)
-	projects := s.listProjects()
-	rows := make([][]transport.Button, 0, (len(projects)+1)/2)
+func (s *Service) sendProjects(address transport.Address, path string) {
+	listing, err := s.browseProjects(path)
+	if err != nil {
+		s.send(address, "Cannot browse that directory. Use a relative path beneath the configured project root.")
+		return
+	}
+	message := s.projectsMessage(address, listing)
+	limit := 96
+	if address.Transport == transport.Discord {
+		limit = 10
+	}
+	if len(listing.Entries) > limit {
+		message += fmt.Sprintf("\n\nNavigation buttons are limited to the first %d directories.", limit)
+	}
+	s.sendKeyboard(address, message, directoryButtons(listing.Entries, limit))
+}
+
+func directoryButtons(projects []project.Project, limit int) [][]transport.Button {
+	if limit < 1 {
+		return nil
+	}
+	rows := make([][]transport.Button, 0, (min(len(projects), limit)+1)/2)
 	var row []transport.Button
 	for _, item := range projects {
-		data := "project:" + item.ID
+		if limit == 0 {
+			break
+		}
+		data := "browse:" + item.ID
 		if len(data) > 64 {
 			continue
 		}
 		row = append(row, transport.Button{Text: item.ID, Data: data})
+		limit--
 		if len(row) == 2 {
 			rows = append(rows, row)
 			row = nil
@@ -711,7 +751,7 @@ func (s *Service) sendProjects(address transport.Address) {
 	if len(row) > 0 {
 		rows = append(rows, row)
 	}
-	s.sendKeyboard(address, message, rows)
+	return rows
 }
 
 func (s *Service) agentsMessage(address transport.Address) string {
@@ -888,13 +928,20 @@ func (s *Service) refreshCatalog() error {
 func (s *Service) getProject(id string) (project.Project, bool) {
 	s.catalogMu.RLock()
 	defer s.catalogMu.RUnlock()
-	return s.catalog.Get(id)
+	resolved, err := s.catalog.ResolveDirectory(id)
+	return resolved, err == nil
 }
 
 func (s *Service) listProjects() []project.Project {
 	s.catalogMu.RLock()
 	defer s.catalogMu.RUnlock()
 	return s.catalog.List()
+}
+
+func (s *Service) browseProjects(path string) (project.Directory, error) {
+	s.catalogMu.RLock()
+	defer s.catalogMu.RUnlock()
+	return s.catalog.BrowseDirectory(path)
 }
 
 func (s *Service) selectedAgent(address transport.Address) string {
