@@ -1,0 +1,55 @@
+name: Bug report
+description: Report reproducible Agent Relay behavior.
+title: "[Bug] "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: Do not include Telegram bot tokens, Codex credentials, private prompts, or repository secrets.
+
+  - type: textarea
+    id: description
+    attributes:
+      label: Description
+      description: What happened, and what did you expect instead?
+    validations:
+      required: true
+
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Reproduction
+      description: Provide the smallest sequence of steps that reproduces the issue.
+    validations:
+      required: true
+
+  - type: input
+    id: version
+    attributes:
+      label: Agent Relay version
+      placeholder: Commit SHA or release version
+    validations:
+      required: true
+
+  - type: input
+    id: codex-version
+    attributes:
+      label: Codex CLI version
+      placeholder: Output of codex --version
+    validations:
+      required: true
+
+  - type: textarea
+    id: environment
+    attributes:
+      label: Environment
+      description: Linux distribution, architecture, and Go version if building from source.
+    validations:
+      required: true
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Sanitized logs
+      description: Remove tokens, credentials, prompts, paths, and private repository content.
+      render: text

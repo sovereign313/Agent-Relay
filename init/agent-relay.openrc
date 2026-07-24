@@ -1,0 +1,22 @@
+#!/sbin/openrc-run
+
+name="Agent Relay"
+description="Telegram relay for local Codex sessions"
+command="/usr/local/bin/agent-relay"
+command_args="run --config /etc/agent-relay/config.toml"
+command_user="agent-relay:agent-relay"
+directory="/var/lib/agent-relay"
+pidfile="/run/${RC_SVCNAME}.pid"
+command_background="yes"
+output_log="/var/log/agent-relay/stdout.log"
+error_log="/var/log/agent-relay/stderr.log"
+
+depend() {
+    need net
+    after firewall
+}
+
+start_pre() {
+    checkpath --directory --mode 0700 --owner "$command_user" /var/lib/agent-relay
+    checkpath --directory --mode 0700 --owner "$command_user" /var/log/agent-relay
+}

@@ -1,0 +1,27 @@
+telegram_token = "BOT_TOKEN"
+# Alternatively, remove telegram_token and use:
+# telegram_token_env = "AGENT_RELAY_TELEGRAM_TOKEN"
+
+allowed_user_ids = [
+  123456789
+]
+
+private_chats_only = true
+project_roots = ["/mnt/external/projects"]
+project_discovery_depth = 5
+state_file = "./var/state.json"
+log_file = "./var/agent-relay.log"
+log_max_bytes = 10485760
+log_backups = 3
+queue_size = 5
+max_message_bytes = 32768
+task_timeout = "2h"
+
+[project_aliases]
+harness-studio = "WaspLogic/HarnessStudio"
+rapidrfq = "WaspLogic/RapidRFQ"
+
+[codex]
+command = "codex"
+args = []
+full_access = true

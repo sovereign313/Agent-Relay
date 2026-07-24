@@ -1,0 +1,222 @@
+package relay
+
+import (
+	"context"
+	"io"
+	"log/slog"
+	"os"
+	"path/filepath"
+	"strings"
+	"sync"
+	"testing"
+	"time"
+
+	"github.com/sovereign313/Agent-Relay/internal/codex"
+	"github.com/sovereign313/Agent-Relay/internal/config"
+	"github.com/sovereign313/Agent-Relay/internal/project"
+	"github.com/sovereign313/Agent-Relay/internal/store"
+	"github.com/sovereign313/Agent-Relay/internal/telegram"
+)
+
+func TestServiceKeepsSeparateDurableProjectThread(t *testing.T) {
+	root := t.TempDir()
+	repo := filepath.Join(root, "Alpha")
+	if err := os.MkdirAll(filepath.Join(repo, ".git"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	configPath := filepath.Join(root, "config.toml")
+	configData := `telegram_token = "test-token"
+allowed_user_ids = [42]
+project_roots = ["` + root + `"]
+queue_size = 2
+task_timeout = "1m"
+state_file = "./state.json"
+`
+	if err := os.WriteFile(configPath, []byte(configData), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := config.Load(configPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	catalog, err := project.Discover([]string{root}, nil, cfg.ProjectDiscoveryDepth)
+	if err != nil {
+		t.Fatal(err)
+	}
+	stateStore, err := store.Open(filepath.Join(root, "state.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	fakeTelegram := &recordingTelegram{}
+	fakeRunner := &recordingRunner{called: make(chan struct{}, 2)}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	service := New(
+		ctx,
+		cfg,
+		slog.New(slog.NewTextHandler(io.Discard, nil)),
+		fakeTelegram,
+		stateStore,
+		catalog,
+		fakeRunner,
+		"test",
+		"codex-test",
+	)
+	defer service.sessions.Close()
+
+	if err := service.handleUpdate(ctx, textUpdate(1, "/project alpha")); err != nil {
+		t.Fatal(err)
+	}
+	if err := service.handleUpdate(ctx, textUpdate(2, "first task")); err != nil {
+		t.Fatal(err)
+	}
+	waitCall(t, fakeRunner.called)
+	waitForState(t, stateStore, 42, "alpha", store.StateIdle)
+
+	if err := service.handleUpdate(ctx, textUpdate(3, "second task")); err != nil {
+		t.Fatal(err)
+	}
+	waitCall(t, fakeRunner.called)
+	waitForState(t, stateStore, 42, "alpha", store.StateIdle)
+
+	if err := service.handleUpdate(ctx, textUpdate(3, "duplicate delivery")); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(10 * time.Millisecond)
+	requests := fakeRunner.Requests()
+	if len(requests) != 2 {
+		t.Fatalf("runner received %d requests after duplicate update", len(requests))
+	}
+	if requests[0].ThreadID != "" {
+		t.Fatalf("first request thread = %q", requests[0].ThreadID)
+	}
+	if requests[1].ThreadID != "thread-alpha" {
+		t.Fatalf("second request thread = %q, want thread-alpha", requests[1].ThreadID)
+	}
+	if conversation, ok := stateStore.Conversation(42, "alpha"); !ok || conversation.ThreadID != "thread-alpha" {
+		t.Fatalf("persisted conversation = %#v, %v", conversation, ok)
+	}
+
+	conversation, _ := stateStore.Conversation(42, "alpha")
+	conversation.ProjectPath = "/old/project/path"
+	if err := stateStore.PutConversation(conversation); err != nil {
+		t.Fatal(err)
+	}
+	if err := service.handleUpdate(ctx, textUpdate(4, "task after path change")); err != nil {
+		t.Fatal(err)
+	}
+	waitCall(t, fakeRunner.called)
+	waitForState(t, stateStore, 42, "alpha", store.StateIdle)
+	requests = fakeRunner.Requests()
+	if len(requests) != 3 || requests[2].ThreadID != "" {
+		t.Fatalf("path-changed request reused thread: %#v", requests)
+	}
+
+	service.deliverOutbox(ctx)
+	if outbox := stateStore.Outbox(); len(outbox) != 0 {
+		t.Fatalf("delivered outbox still contains %#v", outbox)
+	}
+}
+
+type recordingTelegram struct {
+	mu       sync.Mutex
+	messages []string
+}
+
+func (t *recordingTelegram) GetUpdates(context.Context, int64) ([]telegram.Update, error) {
+	return nil, nil
+}
+
+func (t *recordingTelegram) Send(_ context.Context, _ int64, message string) error {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.messages = append(t.messages, message)
+	return nil
+}
+
+func (t *recordingTelegram) SendKeyboard(_ context.Context, _ int64, message string, _ [][]telegram.Button) error {
+	return t.Send(context.Background(), 0, message)
+}
+
+func (t *recordingTelegram) AnswerCallback(context.Context, string, string) error {
+	return nil
+}
+
+type recordingRunner struct {
+	mu       sync.Mutex
+	requests []codex.Request
+	called   chan struct{}
+}
+
+func (r *recordingRunner) Run(_ context.Context, request codex.Request) (codex.Result, error) {
+	r.mu.Lock()
+	r.requests = append(r.requests, request)
+	r.mu.Unlock()
+	threadID := request.ThreadID
+	if threadID == "" {
+		threadID = "thread-alpha"
+		if request.OnThread != nil {
+			if err := request.OnThread(threadID); err != nil {
+				return codex.Result{}, err
+			}
+		}
+	}
+	r.called <- struct{}{}
+	return codex.Result{ThreadID: threadID, FinalMessage: "done"}, nil
+}
+
+func (r *recordingRunner) Requests() []codex.Request {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return append([]codex.Request(nil), r.requests...)
+}
+
+func textUpdate(id int64, text string) telegram.Update {
+	return telegram.Update{
+		UpdateID: id,
+		Message: &telegram.Message{
+			From: telegram.User{ID: 42},
+			Chat: telegram.Chat{ID: 42, Type: "private"},
+			Text: text,
+		},
+	}
+}
+
+func waitCall(t *testing.T, called <-chan struct{}) {
+	t.Helper()
+	select {
+	case <-called:
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for Codex runner")
+	}
+}
+
+func waitForState(t *testing.T, stateStore *store.Store, chatID int64, projectID string, want store.SessionState) {
+	t.Helper()
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		conversation, ok := stateStore.Conversation(chatID, projectID)
+		if ok && conversation.State == want {
+			return
+		}
+		time.Sleep(time.Millisecond)
+	}
+	conversation, _ := stateStore.Conversation(chatID, projectID)
+	t.Fatalf("conversation state = %q, want %q", conversation.State, want)
+}
+
+func TestMakeOutboxMessagesPersistsChunksIndependently(t *testing.T) {
+	message := strings.Repeat("x", telegram.MaxMessageLength+100)
+	parts := makeOutboxMessages("job:1", 42, message)
+	if len(parts) != 2 {
+		t.Fatalf("parts = %d, want 2", len(parts))
+	}
+	if parts[0].ID == parts[1].ID {
+		t.Fatal("outbox chunk IDs are not unique")
+	}
+	for _, part := range parts {
+		if len([]rune(part.Text)) > telegram.MaxMessageLength {
+			t.Fatalf("part exceeds Telegram limit: %d", len([]rune(part.Text)))
+		}
+	}
+}

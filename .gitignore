@@ -1,0 +1,6 @@
+/agent-relay
+/var/
+config.toml
+.env
+state.json
+*.log
