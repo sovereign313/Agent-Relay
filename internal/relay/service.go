@@ -716,42 +716,7 @@ func (s *Service) sendProjects(address transport.Address, path string) {
 		s.send(address, "Cannot browse that directory. Use a relative path beneath the configured project root.")
 		return
 	}
-	message := s.projectsMessage(address, listing)
-	limit := 96
-	if address.Transport == transport.Discord {
-		limit = 10
-	}
-	if len(listing.Entries) > limit {
-		message += fmt.Sprintf("\n\nNavigation buttons are limited to the first %d directories.", limit)
-	}
-	s.sendKeyboard(address, message, directoryButtons(listing.Entries, limit))
-}
-
-func directoryButtons(projects []project.Project, limit int) [][]transport.Button {
-	if limit < 1 {
-		return nil
-	}
-	rows := make([][]transport.Button, 0, (min(len(projects), limit)+1)/2)
-	var row []transport.Button
-	for _, item := range projects {
-		if limit == 0 {
-			break
-		}
-		data := "browse:" + item.ID
-		if len(data) > 64 {
-			continue
-		}
-		row = append(row, transport.Button{Text: item.ID, Data: data})
-		limit--
-		if len(row) == 2 {
-			rows = append(rows, row)
-			row = nil
-		}
-	}
-	if len(row) > 0 {
-		rows = append(rows, row)
-	}
-	return rows
+	s.send(address, s.projectsMessage(address, listing))
 }
 
 func (s *Service) agentsMessage(address transport.Address) string {

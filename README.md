@@ -228,7 +228,7 @@ user, paths, and agent credentials before installing it.
 ## Bot Commands
 
 - `/projects [relative-path]` or `/list [relative-path]`: list only the immediate
-  subdirectories at that location, with navigation buttons.
+  subdirectories at that location as compact plain text.
 - `/project <relative-path>`: select any directory beneath a configured project
   root and resume its existing context when present.
 - `/agents`: list enabled agents with selection buttons.

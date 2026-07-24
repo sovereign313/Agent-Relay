@@ -3,7 +3,6 @@ package relay
 import (
 	"context"
 	"errors"
-	"fmt"
 	"io"
 	"log/slog"
 	"os"
@@ -319,6 +318,9 @@ state_file = "./state.json"
 		!strings.Contains(messages[0], "Work Space/") || strings.Contains(messages[0], "Nested/") {
 		t.Fatalf("browse response = %#v", messages)
 	}
+	if calls := fakeTelegram.KeyboardCalls(); calls != 0 {
+		t.Fatalf("keyboard calls = %d, want 0", calls)
+	}
 	if err := service.handleUpdate(ctx, textUpdate(2, "/project group/work space")); err != nil {
 		t.Fatal(err)
 	}
@@ -328,8 +330,9 @@ state_file = "./state.json"
 }
 
 type recordingTelegram struct {
-	mu       sync.Mutex
-	messages []string
+	mu            sync.Mutex
+	messages      []string
+	keyboardCalls int
 }
 
 type recordingSender struct {
@@ -421,7 +424,11 @@ func (t *recordingTelegram) Send(_ context.Context, _ string, message string) er
 }
 
 func (t *recordingTelegram) SendKeyboard(_ context.Context, _ string, message string, _ [][]transport.Button) error {
-	return t.Send(context.Background(), "0", message)
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.keyboardCalls++
+	t.messages = append(t.messages, message)
+	return nil
 }
 
 func (t *recordingTelegram) AnswerAction(context.Context, string, string) error {
@@ -432,6 +439,12 @@ func (t *recordingTelegram) Messages() []string {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	return append([]string(nil), t.messages...)
+}
+
+func (t *recordingTelegram) KeyboardCalls() int {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return t.keyboardCalls
 }
 
 type recordingRunner struct {
@@ -547,31 +560,6 @@ func TestMakeOutboxMessagesPersistsChunksIndependently(t *testing.T) {
 		if len([]rune(part.Text)) > telegram.MaxMessageLength {
 			t.Fatalf("part exceeds Telegram limit: %d", len([]rune(part.Text)))
 		}
-	}
-}
-
-func TestDirectoryButtonsRespectTransportLimit(t *testing.T) {
-	projects := make([]project.Project, 120)
-	for index := range projects {
-		projects[index] = project.Project{ID: fmt.Sprintf("project-%03d", index)}
-	}
-
-	rows := directoryButtons(projects, 96)
-	buttons := 0
-	for _, row := range rows {
-		if len(row) > 2 {
-			t.Fatalf("row contains %d buttons", len(row))
-		}
-		buttons += len(row)
-	}
-	if buttons != 96 {
-		t.Fatalf("buttons = %d, want 96", buttons)
-	}
-	if len(rows) != 48 {
-		t.Fatalf("rows = %d, want 48", len(rows))
-	}
-	if rows[0][0].Data != "browse:project-000" {
-		t.Fatalf("first callback = %q", rows[0][0].Data)
 	}
 }
 
